@@ -1,0 +1,28 @@
+# ---- 実データ（絶対にコミットしない） ----
+data/
+db/
+reports/
+*.db
+*.db.bak*
+*.sqlite
+*.sqlite3
+*.csv
+*.pdf
+# サンプルデータだけは追跡する
+!examples/**/*.csv
+
+# 個人固有の設定（本人名義・給与振込元など）
+config/classify_local.json
+*.env
+
+# ---- Python ----
+__pycache__/
+*.py[co]
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/
+
+# ---- ML 成果物 ----
+*.joblib
+py/ai/models/

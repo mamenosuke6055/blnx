@@ -1,0 +1,5 @@
+{
+    "db_path": "db/finance.db",
+    "dictionary_db_path": "db/dictionary.db",
+    "raw_imports_db_path": "db/raw_imports.db"
+}

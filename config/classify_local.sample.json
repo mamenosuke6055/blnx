@@ -1,0 +1,5 @@
+{
+    "_comment": "銀行入金分類の個人固有キーワード。このファイルを config/classify_local.json にコピーして自分の名義に書き換える（classify_local.json はバージョン管理しない）。owner_transfer_names = 本人名義振込の名義（全角/半角カナ等の表記揺れを列挙、自己資金移動として P/L から除外）。salary_payer_names = 給与振込元の名義（摘要に『給与』等の語が無い振込を給与と判定する補完）。",
+    "owner_transfer_names": ["ヤマダ", "ﾔﾏﾀﾞ"],
+    "salary_payer_names": ["タナカ"]
+}
