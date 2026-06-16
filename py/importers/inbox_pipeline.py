@@ -24,7 +24,7 @@ from py.importers import import_rakuten_sec
 from py.importers import import_dneobank
 from py.importers import import_sbi_sec
 from py.importers import import_resona_bank
-from py.importers.detect_source import detect_source
+from py.importers.detect_source import detect_source, ignored_report
 from py.importers import raw_archive
 from py.importers import import_gate
 from py.analysis.import_watermark import compute_watermarks, render_table
@@ -66,12 +66,24 @@ def process_inbox_file(csv_file: Path, db_path: Path, raw_conn: sqlite3.Connecti
     """
     record = {"file": csv_file.name, "source": None, "archived": False,
               "duplicate_file": False, "new_tx": None, "imported": False, "error": None,
-              "period": None, "period_overlap": []}
+              "ignored": False, "period": None, "period_overlap": []}
+
+    # 取込対象外と分かっている SBI レポート類は detect_source より前に拾い、
+    # 「種別不明」でなく『対象外・代替・今後DL不要』を明示する。
+    ig = ignored_report(csv_file)
+    if ig:
+        label, advice = ig
+        record["ignored"] = True
+        record["source"] = "ignored"
+        record["error"] = (f"取込対象外（{label}）。"
+                           + (f"{advice}。" if advice else "")
+                           + "今後ダウンロード不要です。")
+        return record
 
     source = detect_source(csv_file)
     record["source"] = source
     if source is None:
-        record["error"] = "種別不明"
+        record["error"] = "種別不明（未対応フォーマット）"
         return record
 
     try:
@@ -128,6 +140,9 @@ def run_inbox_import(inbox_dir: Path, db_path: Path, processed_dir: Path | None 
         for csv_file in csv_files:
             rec = process_inbox_file(csv_file, db_path, raw_conn)
             records.append(rec)
+            if rec["ignored"]:
+                print(f"  [対象外] {csv_file.name} — {rec['error']}")
+                continue
             if rec["error"]:
                 print(f"  [スキップ/{rec['source'] or '不明'}] {csv_file.name} — {rec['error']}")
                 continue
@@ -147,13 +162,23 @@ def run_inbox_import(inbox_dir: Path, db_path: Path, processed_dir: Path | None 
         raw_conn.close()
 
     ok = [r for r in records if r["imported"]]
-    skipped = [r for r in records if not r["imported"]]
+    ignored = [r for r in records if r["ignored"]]
+    skipped = [r for r in records if not r["imported"] and not r["ignored"]]
     total_new = sum(r["new_tx"] for r in ok)
-    print(f"\n取込完了: {len(ok)} ファイル / 新規 {total_new} 件"
-          + (f" / スキップ {len(skipped)} ファイル" if skipped else ""))
+    summary = f"\n取込完了: {len(ok)} ファイル / 新規 {total_new} 件"
+    if ignored:
+        summary += f" / 対象外 {len(ignored)} ファイル"
     if skipped:
+        summary += f" / スキップ {len(skipped)} ファイル"
+    print(summary)
+    if ignored:
+        print("  ── 取込対象外（今後ダウンロード不要）──")
+        for r in ignored:
+            print(f"    - {r['file']}: {r['error']}")
+    if skipped:
+        print("  ── スキップ（要対応: 未対応フォーマット/取込失敗）──")
         for r in skipped:
-            print(f"  - {r['file']}: {r['error']}")
+            print(f"    - {r['file']}: {r['error']}")
 
     if show_watermark:
         finance_conn = sqlite3.connect(db_path)

@@ -29,6 +29,34 @@ def _read_lines(csv_path: Path, n: int = 30) -> list[str]:
     return []
 
 
+# 取込対象外と分かっている SBI のレポート/サマリー類。家計簿(複式簿記)には
+# 不要だが、画面から誤って DL されがち。これらは「種別不明」でなく
+# 『対象外・代替・今後DL不要』を明示する（detect_source より前に判定する）。
+# (pattern, 種別名, 代わりに使うべきファイル|None)
+_IGNORED_REPORTS = [
+    (r'^summaryall',           'SBI 全体サマリー（集計レポート）', None),
+    (r'^summaryyear',          'SBI 年間サマリー（集計レポート）', None),
+    (r'^shisanchart',          'SBI 資産推移チャート（集計レポート）', None),
+    (r'realized_pl',           'SBI 実現損益レポート',
+     '売却の記録は約定履歴(yakujo / tradehistory)を使ってください'),
+    (r'assetbalance\(invst\)', 'SBI 投信資産明細レポート',
+     '保有スナップは保有証券一覧(SaveFile)を使ってください'),
+]
+
+
+def ignored_report(csv_path: Path) -> tuple[str, str | None] | None:
+    """取込対象外と分かっている SBI レポートなら (種別名, 代替案内|None) を返す。
+
+    detect_source の前に呼ぶ。assetbalance(invst) のように既存パターンに誤マッチして
+    取込失敗していたものも、ここで先に拾って明確なメッセージにする。
+    """
+    name = csv_path.name.lower()
+    for pattern, label, advice in _IGNORED_REPORTS:
+        if re.search(pattern, name):
+            return label, advice
+    return None
+
+
 def detect_source(csv_path: Path) -> str | None:
     """
     CSVファイルのソース種別を判定する。

@@ -86,7 +86,8 @@ def test_unknown_source_is_skipped(finance_db, raw_conn, tmp_path):
     rec = inbox_pipeline.process_inbox_file(csv, finance_db, raw_conn)
     assert rec["source"] is None
     assert rec["imported"] is False
-    assert rec["error"] == "種別不明"
+    assert rec["ignored"] is False  # 真の未知は「対象外」とは区別する
+    assert rec["error"] == "種別不明（未対応フォーマット）"
     assert len(raw_archive.list_archived(raw_conn)) == 0
 
 
