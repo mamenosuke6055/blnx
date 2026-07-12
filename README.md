@@ -32,6 +32,10 @@
 # 依存のインストール
 uv sync
 
+# （任意）blnx コマンドをどのディレクトリからでも呼べるようにする
+uv tool install --editable .
+# コード変更後に反映されないときは再インストール: uv tool install --editable . --reinstall
+
 # 1. データベースの初期化
 uv run python py/init/init_db.py
 
@@ -79,6 +83,10 @@ uv run python scripts/watch_sbi_sec.py --once   # 既存ファイルを一括処
 ```
 
 ## 主要コマンド
+
+`uv tool install --editable .` 済みなら、以下はどのディレクトリからでも
+`blnx <サブコマンド>`（例: `blnx import inbox` / `blnx balance-sheet`）で同等に実行できます。
+サブコマンド一覧は `blnx --help` を参照してください。
 
 ```bash
 # インポート

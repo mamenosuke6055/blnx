@@ -6,7 +6,7 @@ import json
 
 # Add the project root to the sys.path to allow importing modules
 project_root = Path(__file__).resolve().parents[1]
-sys.path.append(str(project_root))
+sys.path.insert(0, str(project_root))
 
 print(f"DEBUG: project_root = {project_root}")
 print(f"DEBUG: sys.path = {sys.path}")

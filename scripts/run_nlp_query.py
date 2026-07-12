@@ -4,7 +4,7 @@ import os
 import argparse
 
 project_root = Path(__file__).resolve().parent.parent
-sys.path.append(str(project_root))
+sys.path.insert(0, str(project_root))
 
 from py.ai.nlp_query import ask
 

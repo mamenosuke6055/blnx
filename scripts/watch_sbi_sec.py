@@ -14,7 +14,7 @@ import logging
 from pathlib import Path
 
 project_root = Path(__file__).resolve().parent.parent
-sys.path.append(str(project_root))
+sys.path.insert(0, str(project_root))
 
 from py.importers.import_sbi_sec import import_sbi_sec_csv
 

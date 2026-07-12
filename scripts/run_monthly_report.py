@@ -6,7 +6,7 @@ from datetime import datetime
 
 # Add the project root to the Python path
 project_root = Path(__file__).resolve().parent.parent
-sys.path.append(str(project_root))
+sys.path.insert(0, str(project_root))
 
 from py.analysis.generate_monthly_expense_report import generate_monthly_report
 

@@ -3,7 +3,7 @@ from pathlib import Path
 import os
 
 project_root = Path(__file__).resolve().parent.parent
-sys.path.append(str(project_root))
+sys.path.insert(0, str(project_root))
 
 from py.ai.llm_categorize import categorize_with_llm
 
