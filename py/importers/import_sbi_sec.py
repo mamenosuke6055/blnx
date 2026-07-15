@@ -276,6 +276,20 @@ def _parse_int_jpy(val) -> int:
 _HOLDINGS_HEADER_KEY = 'ファンド名'
 
 
+def _account_guid_by_path(conn: sqlite3.Connection, name_path: list[str]) -> str | None:
+    """口座パスを guid に解決する（lookup のみ、作成しない）。無ければ None。"""
+    parent_guid = None
+    for name in name_path:
+        row = conn.execute(
+            "SELECT guid FROM accounts WHERE name = ? AND parent_guid IS ?",
+            (name, parent_guid),
+        ).fetchone()
+        if row is None:
+            return None
+        parent_guid = row[0]
+    return parent_guid
+
+
 def import_sbi_holdings_list(csv_path: Path, snapshot_date: str | None = None) -> dict:
     """SBI『保有証券一覧』CSV（SaveFile, cp932, セクション構造）の時価を asset_snapshots へ取り込む。
 
@@ -301,6 +315,9 @@ def import_sbi_holdings_list(csv_path: Path, snapshot_date: str | None = None) -
     col: dict[str, int] | None = None
     matched = skipped = 0
     unmatched: list[dict] = []
+    # 消えた銘柄のゼロ化用: 今回一覧に登場した口座 guid と、走査した口座枠
+    present_guids: set[str] = set()
+    account_types_seen: set[str] = set()
 
     for row in reader:
         non_empty = [c for c in row if (c or '').strip()]
@@ -334,6 +351,8 @@ def import_sbi_holdings_list(csv_path: Path, snapshot_date: str | None = None) -
         if '取得金額' in col and col['取得金額'] < len(row):
             book = _parse_int_jpy(row[col['取得金額']])
 
+        if current_account_type is not None:
+            account_types_seen.add(current_account_type)
         guid, score = _find_matching_account(conn, current_account_type, fund_name)
         if guid is None:
             unmatched.append({
@@ -344,6 +363,7 @@ def import_sbi_holdings_list(csv_path: Path, snapshot_date: str | None = None) -
             })
             continue
 
+        present_guids.add(guid)
         if conn.execute(
             "SELECT 1 FROM asset_snapshots WHERE date = ? AND account_guid = ?",
             (snapshot_date, guid),
@@ -360,16 +380,56 @@ def import_sbi_holdings_list(csv_path: Path, snapshot_date: str | None = None) -
         )
         matched += 1
 
+    # 一覧から消えた銘柄のゼロ化。『保有証券一覧』は SBI 投信保有の全量スナップなので、
+    # 走査した口座枠配下にあるのに今回登場しなかった銘柄（最新スナップが正値）は
+    # 売却済みとみなし、同日付の 0 円スナップで閉じる。これが無いと売却済み
+    # ポジションの最新正値スナップが 3 バケツ/BS に幽霊時価として残り続ける
+    # (fd f7bae04c の 2026-06-17 日本高配当 全解約で発覚)。他ブローカーの休眠口座の
+    # 凍結スナップ保持（旧 fossil b3c14d04cb 対策）には触れない — SBI の枠配下のみ。
+    zeroed = 0
+    for at in sorted(account_types_seen):
+        parent_guid = _account_guid_by_path(
+            conn, ['Assets', 'Investments', 'SBI Securities', at]
+        )
+        if parent_guid is None:
+            continue
+        for (acct_guid,) in conn.execute(
+            "SELECT guid FROM accounts WHERE parent_guid = ?", (parent_guid,)
+        ).fetchall():
+            if acct_guid in present_guids:
+                continue
+            if conn.execute(
+                "SELECT 1 FROM asset_snapshots WHERE date = ? AND account_guid = ?",
+                (snapshot_date, acct_guid),
+            ).fetchone():
+                continue
+            latest = conn.execute(
+                """SELECT market_value_num * 1.0 / market_value_denom
+                   FROM asset_snapshots WHERE account_guid = ? AND date < ?
+                   ORDER BY date DESC LIMIT 1""",
+                (acct_guid, snapshot_date),
+            ).fetchone()
+            if not latest or latest[0] <= 0:
+                continue
+            conn.execute(
+                "INSERT INTO asset_snapshots "
+                "(guid, date, account_guid, market_value_num, market_value_denom, "
+                " book_value_num, book_value_denom, currency_guid) "
+                "VALUES (?, ?, ?, 0, 1, 0, 1, ?)",
+                (uuid.uuid4().hex, snapshot_date, acct_guid, jpy_guid),
+            )
+            zeroed += 1
+
     conn.commit()
     conn.close()
 
     print(f"SBI保有証券一覧 {snapshot_date}: matched={matched}, skipped={skipped}, "
-          f"unmatched={len(unmatched)} ({csv_path.name})")
+          f"unmatched={len(unmatched)}, zeroed={zeroed} ({csv_path.name})")
     for u in unmatched:
         print(f"  [未マッチ] {u['account_type']} / {u['fund_name']} "
               f"評価額={u['valuation']:,} (best={u['best_score']})")
     return {'snapshot_date': snapshot_date, 'matched': matched,
-            'skipped': skipped, 'unmatched': unmatched}
+            'skipped': skipped, 'unmatched': unmatched, 'zeroed': zeroed}
 
 
 def import_sbi_fund_list(csv_path: Path):
@@ -496,6 +556,7 @@ def import_sbi_domestic_trade_history(csv_path: Path):
     cash_account = get_or_create_account_guid(
         conn, ['Assets', 'Bank', 'SBI Securities', 'JPY_clearing'], 'ASSET', 'BANK'
     )
+    income_div_account = get_or_create_account_guid(conn, ['Income', 'Dividend'], 'INCOME')
     conn.commit()
 
     new_tx_count = 0
@@ -527,12 +588,15 @@ def import_sbi_domestic_trade_history(csv_path: Path):
         if cursor.fetchone():
             continue
 
-        # 取引種別判別を INSERT 前に行う。買付/売却以外（例: 分配金再投資）は
-        # ここでスキップする。以前は INSERT 後に conn.rollback() で巻き戻す実装だったが、
+        # 取引種別判別を INSERT 前に行う。対応外種別はここでスキップする。
+        # 以前は INSERT 後に conn.rollback() で巻き戻す実装だったが、
         # commit はループ後の1回のみのため、Unknown 1件で**それまで保存した全 tx も
         # 巻き戻す**バグがあった (fd 0280bc08 で発覚: 217件CSV取込で 217件中分配金再投資2件が原因で
         # 投信買付の取込が大量に消失していた)。
-        if '買付' not in tx_type_raw and '売却' not in tx_type_raw:
+        is_reinvest = '再投資' in tx_type_raw  # 分配金再投資 = 分配金収入を原資とする買付
+        is_buy = '買付' in tx_type_raw
+        is_sell = '売却' in tx_type_raw or '解約' in tx_type_raw  # 投信金額解約 = 換金(SELL)
+        if not (is_reinvest or is_buy or is_sell):
             print(f"Unknown tx type: {tx_type_raw}")
             continue
 
@@ -543,7 +607,18 @@ def import_sbi_domestic_trade_history(csv_path: Path):
             VALUES (?, ?, ?, ?, ?)
         """, (tx_guid, trade_date, desc, fitid, jpy_guid))
 
-        if '買付' in tx_type_raw:
+        if is_reinvest:
+            # Debit: Security (increase), Credit: Income:Dividend
+            cursor.execute("""
+                INSERT INTO splits (guid, tx_guid, account_guid, value_num, value_denom, quantity_num, quantity_denom)
+                VALUES (?, ?, ?, ?, 1, ?, 10000)
+            """, (uuid.uuid4().hex, tx_guid, security_account, int(settlement), int(units * 10000)))
+            cursor.execute("""
+                INSERT INTO splits (guid, tx_guid, account_guid, value_num, value_denom, quantity_num, quantity_denom)
+                VALUES (?, ?, ?, ?, 1, ?, 1)
+            """, (uuid.uuid4().hex, tx_guid, income_div_account, -int(settlement), -int(settlement)))
+            inv_type = 'REINVEST'
+        elif is_buy:
             # Debit: Security (increase), Credit: Cash (decrease)
             cursor.execute("""
                 INSERT INTO splits (guid, tx_guid, account_guid, value_num, value_denom, quantity_num, quantity_denom)
@@ -554,7 +629,7 @@ def import_sbi_domestic_trade_history(csv_path: Path):
                 VALUES (?, ?, ?, ?, 1, ?, 1)
             """, (uuid.uuid4().hex, tx_guid, cash_account, -int(settlement), -int(settlement)))
             inv_type = 'BUY'
-        elif '売却' in tx_type_raw:  # H1 修正: 3-way (Cash + Asset@cost + P/L)
+        elif is_sell:  # H1 修正: 3-way (Cash + Asset@cost + P/L)
             cost_per_unit, _ = calc_moving_avg_cost_per_unit(conn, security_account, trade_date)
             cap_gain = get_capital_gain_account_guid(conn)
             cap_loss = get_capital_loss_account_guid(conn)
@@ -745,26 +820,38 @@ def import_sbi_trade_history(csv_path: Path):
     cursor = conn.cursor()
     
     sbi_usd_cash_account = get_or_create_account_guid(conn, ['Assets', 'Bank', 'SBI Securities', 'USD'], 'ASSET', 'BANK')
-    income_div_account = get_or_create_account_guid(conn, ['Income', 'Dividend', 'USD'], 'INCOME')
-    
+    income_div_usd_account = get_or_create_account_guid(conn, ['Income', 'Dividend', 'USD'], 'INCOME')
+    jpy_clearing_account = get_or_create_account_guid(
+        conn, ['Assets', 'Bank', 'SBI Securities', 'JPY_clearing'], 'ASSET', 'BANK'
+    )
+    income_div_jpy_account = get_or_create_account_guid(conn, ['Income', 'Dividend'], 'INCOME')
+
     usd_guid = get_currency_guid(conn, 'USD')
-    
+    jpy_guid = get_currency_guid(conn, 'JPY')
+
     conn.commit()
-    
+
     new_tx_count = 0
 
     for _, row in df.iterrows():
         trade_date = parse_sbi_date(row['国内約定日'])
         settle_date = parse_sbi_date(row['国内受渡日'])
         if not trade_date: continue
-        
+
         security_name = row['銘柄名']
         tx_type = row['取引']
         units = parse_amount(row['約定数量'])
-        unit_price = parse_amount(row['約定単価'])
+        # 円貨決済行の約定単価は '0.01(160.55)' 形式（括弧内 = 適用為替レート）。外貨単価のみ採る。
+        unit_price = parse_amount(str(row['約定単価']).split('(')[0])
         total_amount = parse_amount(row['受渡金額']) # Usually total value
         currency = row['通貨']
-        
+
+        # 円貨決済行(通貨 = 日本円)は受渡金額が JPY のため、現金側・通貨とも JPY で記帳する。
+        is_jpy = str(currency).strip() == '日本円'
+        ccy_guid = jpy_guid if is_jpy else usd_guid
+        cash_account = jpy_clearing_account if is_jpy else sbi_usd_cash_account
+        income_div_account = income_div_jpy_account if is_jpy else income_div_usd_account
+
         # Determine Security Account
         # Use full name or extract code if possible. 
         # Example: "ブラックロック・スーパー・マネー・マーケット・ファンド（米ドル） X0934000"
@@ -786,8 +873,8 @@ def import_sbi_trade_history(csv_path: Path):
         cursor.execute("""
             INSERT INTO transactions (guid, post_date, description, ofx_fitid, currency_guid)
             VALUES (?, ?, ?, ?, ?)
-        """, (tx_guid, trade_date, desc, fitid, usd_guid))
-        
+        """, (tx_guid, trade_date, desc, fitid, ccy_guid))
+
         # Determine logic based on type
         # '再投資' (Reinvest) -> Income:Dividend -> Security
         # '買付' (Buy) -> Bank/Cash -> Security
@@ -814,7 +901,7 @@ def import_sbi_trade_history(csv_path: Path):
             cursor.execute("""
                 INSERT INTO investment_transactions (guid, tx_guid, security_guid, type, units, unit_price, total_amount, currency_guid, trade_date, settle_date)
                 VALUES (?, ?, ?, 'REINVEST', ?, ?, ?, ?, ?, ?)
-            """, (inv_tx_guid, tx_guid, security_account, units, unit_price, total_amount, usd_guid, trade_date, settle_date))
+            """, (inv_tx_guid, tx_guid, security_account, units, unit_price, total_amount, ccy_guid, trade_date, settle_date))
 
         elif tx_type == '買付':
             # Debit Security (Increase)
@@ -827,14 +914,14 @@ def import_sbi_trade_history(csv_path: Path):
             cursor.execute("""
                 INSERT INTO splits (guid, tx_guid, account_guid, value_num, value_denom, quantity_num, quantity_denom)
                 VALUES (?, ?, ?, ?, 100, ?, 100)
-            """, (split_funding_guid, tx_guid, sbi_usd_cash_account, int(-total_amount * 100), int(-total_amount * 100)))
+            """, (split_funding_guid, tx_guid, cash_account, int(-total_amount * 100), int(-total_amount * 100)))
 
             # Investment Transaction Record
             inv_tx_guid = uuid.uuid4().hex
             cursor.execute("""
                 INSERT INTO investment_transactions (guid, tx_guid, security_guid, type, units, unit_price, total_amount, currency_guid, trade_date, settle_date)
                 VALUES (?, ?, ?, 'BUY', ?, ?, ?, ?, ?, ?)
-            """, (inv_tx_guid, tx_guid, security_account, units, unit_price, total_amount, usd_guid, trade_date, settle_date))
+            """, (inv_tx_guid, tx_guid, security_account, units, unit_price, total_amount, ccy_guid, trade_date, settle_date))
 
         elif '売却' in tx_type or '売付' in tx_type:  # H2 修正: 元 importer に欠落していた sell 分岐
             # H1 修正: 3-way (Cash + Asset@cost + P/L)、value_denom=100 (USD cents)
@@ -843,7 +930,7 @@ def import_sbi_trade_history(csv_path: Path):
             cap_loss = get_capital_loss_account_guid(conn)
             build_sell_splits(
                 cursor, tx_guid,
-                cash_account_guid=sbi_usd_cash_account,
+                cash_account_guid=cash_account,
                 security_account_guid=security_account,
                 capital_gain_account_guid=cap_gain,
                 capital_loss_account_guid=cap_loss,
@@ -857,7 +944,7 @@ def import_sbi_trade_history(csv_path: Path):
             cursor.execute("""
                 INSERT INTO investment_transactions (guid, tx_guid, security_guid, type, units, unit_price, total_amount, currency_guid, trade_date, settle_date)
                 VALUES (?, ?, ?, 'SELL', ?, ?, ?, ?, ?, ?)
-            """, (inv_tx_guid, tx_guid, security_account, units, unit_price, total_amount, usd_guid, trade_date, settle_date))
+            """, (inv_tx_guid, tx_guid, security_account, units, unit_price, total_amount, ccy_guid, trade_date, settle_date))
 
         else:
             print(f"  Skipped unknown tx type: {tx_type}")

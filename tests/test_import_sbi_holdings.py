@@ -168,3 +168,110 @@ def test_content_based_dispatch_routes_to_holdings(sbi_db, tmp_path, monkeypatch
     _write_savefile(csv_path)
     sbi.import_sbi_sec_csv(csv_path)
     assert called.get("p") == csv_path
+
+
+# ---- 消えた銘柄のゼロ化 ----------------------------------------------------
+# 保有証券一覧は SBI 投信保有の全量スナップ。全売却した銘柄は一覧から消えるが、
+# 旧実装は載っている銘柄しか書かなかったため、最後の正値スナップが 3バケツ/BS に
+# 幽霊時価として残り続けた (fd f7bae04c: 2026-06-17 日本高配当 全解約 ¥19,437 が
+# 売却後も ¥18,480 で計上されていた)。
+
+
+_ZEROED_ROWS = [
+    [],
+    ["保有証券一覧"],
+    [],
+    ["投資信託（金額/NISA預り（成長投資枠））"],
+    [],
+    ["ファンド名", "保有口数", "売却注文中", "取得単価", "基準価額", "取得金額", "評価額", "評価損益", "分配金受取方法"],
+    ["ＳＢＩ・Ｓ・米国高配当株式ファンド（年４回決算型）", "9841口", "", "10345", "12437", "10180", "12239", "+2059", "再投資"],
+    [],
+]
+
+
+@pytest.fixture
+def sbi_full_tree_db(tmp_path, monkeypatch):
+    """実DBと同じ Assets>Investments>SBI Securities>枠>銘柄 の階層を seed する。"""
+    db_path = tmp_path / "finance.db"
+    conn = sqlite3.connect(db_path)
+    create_finance_tables(conn)
+    _mk_account(conn, "Assets", ofx=None)
+    _mk_account(conn, "Investments", "Assets", ofx=None)
+    _mk_account(conn, "SBI Securities", "Investments", ofx=None)
+    _mk_account(conn, "NISA成長投資枠", "SBI Securities", ofx=None)
+    ids = {
+        "us_hd": _mk_account(
+            conn, "ＳＢＩ・Ｓ・米国高配当株式ファンド（年４回決算型）", "NISA成長投資枠"
+        ),
+        "jp_hd": _mk_account(
+            conn, "ＳＢＩ日本高配当株式（分配）ファンド（年４回決算型）", "NISA成長投資枠"
+        ),
+    }
+    # 日本高配当に売却前の正値スナップを seed（このあと全売却され一覧から消える想定）
+    jpy = uuid.uuid4().hex
+    conn.execute(
+        "INSERT INTO currencies (guid, mnemonic, fraction) VALUES (?, 'JPY', 100)", (jpy,)
+    )
+    conn.execute(
+        "INSERT INTO asset_snapshots (guid, date, account_guid, market_value_num, "
+        "market_value_denom, book_value_num, book_value_denom, currency_guid) "
+        "VALUES (?, '2026-06-11', ?, 18480, 1, 17218, 1, ?)",
+        (uuid.uuid4().hex, ids["jp_hd"], jpy),
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(sbi, "get_db_path", lambda: db_path)
+    ids["db_path"] = db_path
+    return ids
+
+
+def _latest_snap(db_path, guid):
+    conn = sqlite3.connect(db_path)
+    row = conn.execute(
+        "SELECT date, market_value_num FROM asset_snapshots "
+        "WHERE account_guid = ? ORDER BY date DESC LIMIT 1",
+        (guid,),
+    ).fetchone()
+    conn.close()
+    return row
+
+
+def test_disappeared_position_gets_zero_snapshot(sbi_full_tree_db, tmp_path):
+    """一覧から消えた銘柄に同日付の 0 円スナップが打たれる。"""
+    csv_path = tmp_path / "SaveFile.csv"
+    with open(csv_path, "w", encoding="cp932", newline="") as f:
+        writer = csv.writer(f)
+        for row in _ZEROED_ROWS:
+            writer.writerow(row)
+    result = sbi.import_sbi_holdings_list(csv_path, snapshot_date="2026-07-15")
+
+    assert result["zeroed"] == 1
+    assert _latest_snap(sbi_full_tree_db["db_path"], sbi_full_tree_db["jp_hd"]) == (
+        "2026-07-15", 0,
+    )
+    # 一覧に載っている銘柄は通常どおり時価が書かれる
+    assert _latest_snap(sbi_full_tree_db["db_path"], sbi_full_tree_db["us_hd"]) == (
+        "2026-07-15", 12239,
+    )
+
+
+def test_zero_snapshot_not_duplicated_on_reimport(sbi_full_tree_db, tmp_path):
+    """再取込で 0 円スナップが重複せず、以後の取込でも再ゼロ化されない。"""
+    csv_path = tmp_path / "SaveFile.csv"
+    with open(csv_path, "w", encoding="cp932", newline="") as f:
+        writer = csv.writer(f)
+        for row in _ZEROED_ROWS:
+            writer.writerow(row)
+    sbi.import_sbi_holdings_list(csv_path, snapshot_date="2026-07-15")
+    r2 = sbi.import_sbi_holdings_list(csv_path, snapshot_date="2026-07-15")
+    r3 = sbi.import_sbi_holdings_list(csv_path, snapshot_date="2026-07-16")
+
+    assert r2["zeroed"] == 0  # 同日再取込: date 重複ガード
+    assert r3["zeroed"] == 0  # 翌日取込: 最新スナップが 0 のため対象外
+    conn = sqlite3.connect(sbi_full_tree_db["db_path"])
+    n = conn.execute(
+        "SELECT COUNT(*) FROM asset_snapshots WHERE account_guid = ? AND market_value_num = 0",
+        (sbi_full_tree_db["jp_hd"],),
+    ).fetchone()[0]
+    conn.close()
+    assert n == 1

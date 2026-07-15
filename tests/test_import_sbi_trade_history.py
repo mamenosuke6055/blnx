@@ -131,12 +131,14 @@ def test_old_format_cp932_still_imports(db, tmp_path):
 
 
 def test_unknown_tx_type_does_not_rollback_others(db, tmp_path):
-    """Unknown tx type (分配金再投資) は他の正常な買付の取込に影響しない。
+    """Unknown tx type は他の正常な買付の取込に影響しない。
 
     過去のバグ (fd 0280bc08 で発見): Unknown 時に conn.rollback() を呼んでいたが、
     commit はループ後の1回のみのため、Unknown 1件で **それまで保存した全 tx も
     巻き戻していた**。217件CSV 取込時、分配金再投資 2件が混じり、その前にあった
     投信買付の大半 (135件) が消失していた。
+    (分配金再投資は 2026-07-15 に REINVEST として対応済みのため、未対応種別の
+    代表は移管入庫で検証する。)
     """
     mixed_rows = [
         [],
@@ -152,7 +154,7 @@ def test_unknown_tx_type_does_not_rollback_others(db, tmp_path):
          "投信金額買付", "--", " NISA(つ) ", "--", "48", "83320", "--", "--", "2026/01/13", "400"],
         # ↓ Unknown tx type。これで他の買付が rollback されないことを検証する
         ["2026/01/08", "ニッセイＮＡＳＤＡＱ１００インデ＜購入・換金手数料なし＞", "", "",
-         "分配金再投資", "--", " NISA(成) ", "--", "10", "1000", "--", "--", "2026/01/14", "1000"],
+         "移管入庫", "--", " NISA(成) ", "--", "10", "1000", "--", "--", "2026/01/14", "1000"],
         ["2026/01/09", "ｉＦｒｅｅＮＥＸＴ　ＦＡＮＧ＋インデックス", "", "",
          "投信金額買付", "--", " NISA(つ) ", "--", "48", "83353", "--", "--", "2026/01/15", "400"],
         [],
@@ -161,8 +163,86 @@ def test_unknown_tx_type_does_not_rollback_others(db, tmp_path):
     _write_csv(p, mixed_rows, "cp932")
     sbi.import_sbi_domestic_trade_history(p)
 
-    # 分配金再投資はスキップされるが、前後の買付 2件は取り込まれる
+    # 移管入庫はスキップされるが、前後の買付 2件は取り込まれる
     assert _inv_count(db) == 2
+
+
+def test_redemption_kaiyaku_imported_as_sell(db, tmp_path):
+    """投信金額解約(換金)が SELL として取り込まれ、貸借が均衡する。
+
+    2026-07-15 取込で発覚 (fd f7bae04c): 解約が Unknown tx type で skip され、
+    2026-06-17 の日本高配当 解約 ¥19,437 が DB から欠落していた。
+    """
+    rows = [
+        [],
+        ["約定履歴照会 "],
+        [],
+        ["商品指定", "約定開始年月日", "約定終了年月日", "明細数", "明細指定開始", "明細指定終了"],
+        ["すべての商品", "2026年06月16日", "2026年06月17日", "2", "1", "2"],
+        [],
+        ["（注）明細数はご指定された期間の合計です。"],
+        [],
+        _OLD_HEADER,
+        ["2026/06/16", "ＳＢＩ日本高配当株式（分配）ファンド（年４回決算型）", "", "",
+         "投信金額買付", "--", " NISA(成) ", "--", "11461", "16891", "--", "--", "2026/06/22", "19360"],
+        ["2026/06/17", "ＳＢＩ日本高配当株式（分配）ファンド（年４回決算型）", "", "",
+         "投信金額解約", "--", " NISA(成) ", "非課税", "11461", "16959", "--", "--", "2026/06/23", "19437"],
+        [],
+    ]
+    p = tmp_path / "SaveFile_kaiyaku.csv"
+    _write_csv(p, rows, "cp932")
+    sbi.import_sbi_domestic_trade_history(p)
+
+    conn = sqlite3.connect(db)
+    sell = conn.execute(
+        "SELECT total_amount FROM investment_transactions WHERE type = 'SELL'"
+    ).fetchone()
+    total = conn.execute("SELECT COALESCE(SUM(value_num), 0) FROM splits").fetchone()[0]
+    conn.close()
+    assert sell is not None
+    assert sell[0] == 19437
+    assert total == 0
+
+
+def test_dividend_reinvest_credits_income_dividend(db, tmp_path):
+    """分配金再投資が REINVEST として取り込まれ、相手勘定が Income:Dividend になる。
+
+    2026-07-15 取込で発覚 (fd f7bae04c): 分配金再投資が skip され、
+    2026-06-29 の SBI・S・米国高配当 再投資 ¥88 が DB から欠落していた。
+    """
+    rows = [
+        [],
+        ["約定履歴照会 "],
+        [],
+        ["商品指定", "約定開始年月日", "約定終了年月日", "明細数", "明細指定開始", "明細指定終了"],
+        ["すべての商品", "2026年06月29日", "2026年06月29日", "1", "1", "1"],
+        [],
+        ["（注）明細数はご指定された期間の合計です。"],
+        [],
+        _OLD_HEADER,
+        ["2026/06/29", "ＳＢＩ・Ｓ・米国高配当株式ファンド（年４回決算型）", "", "",
+         "分配金再投資", "--", " NISA(成) ", "--", "73", "12214", "--", "--", "2026/06/30", "88"],
+        [],
+    ]
+    p = tmp_path / "SaveFile_reinvest.csv"
+    _write_csv(p, rows, "cp932")
+    sbi.import_sbi_domestic_trade_history(p)
+
+    conn = sqlite3.connect(db)
+    reinvest = conn.execute(
+        "SELECT total_amount FROM investment_transactions WHERE type = 'REINVEST'"
+    ).fetchone()
+    div = conn.execute(
+        """SELECT SUM(s.value_num) FROM splits s
+           JOIN accounts a ON a.guid = s.account_guid
+           WHERE a.name = 'Dividend'"""
+    ).fetchone()[0]
+    total = conn.execute("SELECT COALESCE(SUM(value_num), 0) FROM splits").fetchone()[0]
+    conn.close()
+    assert reinvest is not None
+    assert reinvest[0] == 88
+    assert div == -88  # Income credit = 負値
+    assert total == 0
 
 
 def test_buy_splits_balance_to_zero(db, tmp_path):
