@@ -4,8 +4,8 @@
 「最後に取込を実行した日時」を一覧する。CSV を再ダウンロードする際に、
 どの source をどの日付以降から落とせばよいかの判断に使う。
 
-    uv run python scripts/run_import_status.py          # 表形式
-    uv run python scripts/run_import_status.py --json    # JSON(AI-readable)
+    blnx import-status           # 表形式
+    blnx import-status --json    # JSON(AI-readable)
 """
 
 import argparse

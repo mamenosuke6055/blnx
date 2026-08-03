@@ -2,7 +2,7 @@
 """USD/JPY レートを frankfurter.app から取得して finance.db の exchange_rates テーブルに保存する。
 
 使い方:
-    cd /path/to/blnx && uv run python scripts/update_exchange_rates.py
+    blnx update-exchange-rates
 
 APIキー不要。欧州中央銀行（ECB）のデータを使用（平日に日次更新）。
 weekendや祝日は最新の営業日レートが返る。

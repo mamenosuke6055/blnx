@@ -5,10 +5,10 @@ raw_imports.db の生CSVを現行 importer で finance.db に再適用する。i
 重複は増えない。
 
 使い方:
-  uv run python scripts/run_replay.py --dry-run            # 対象アーカイブ一覧（取込なし）
-  uv run python scripts/run_replay.py                      # 全アーカイブをリプレイ（前にバックアップ）
-  uv run python scripts/run_replay.py --source rakuten_card
-  uv run python scripts/run_replay.py --no-backup
+  blnx replay --dry-run            # 対象アーカイブ一覧（取込なし）
+  blnx replay                      # 全アーカイブをリプレイ（前にバックアップ）
+  blnx replay --source rakuten_card
+  blnx replay --no-backup
 """
 import argparse
 import json

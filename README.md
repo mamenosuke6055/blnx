@@ -37,15 +37,15 @@ uv tool install --editable .
 # コード変更後に反映されないときは再インストール: uv tool install --editable . --reinstall
 
 # 1. データベースの初期化
-uv run python py/init/init_db.py
+blnx init-db
 
 # 2. 同梱のサンプル CSV で試運転（架空データ）
 mkdir -p data
 cp examples/inbox/*.csv data/
-uv run python scripts/run_import.py inbox
+blnx import inbox
 
 # 3. 貸借対照表を見る
-uv run python scripts/run_balance_sheet.py
+blnx balance-sheet
 ```
 
 実際の CSV を使うときは、金融機関からエクスポートしたファイルを同じように
@@ -78,34 +78,38 @@ data/                  # 直下にまとめて置くだけで自動判別イン�
 SBI証券は手動ダウンロードが必要なため、ファイル監視モードを用意しています。
 
 ```bash
-uv run python scripts/watch_sbi_sec.py          # 置いたら自動インポート（常駐）
-uv run python scripts/watch_sbi_sec.py --once   # 既存ファイルを一括処理して終了
+blnx watch-sbi-sec          # 置いたら自動インポート（常駐）
+blnx watch-sbi-sec --once   # 既存ファイルを一括処理して終了
 ```
 
 ## 主要コマンド
 
-`uv tool install --editable .` 済みなら、以下はどのディレクトリからでも
-`blnx <サブコマンド>`（例: `blnx import inbox` / `blnx balance-sheet`）で同等に実行できます。
+`uv tool install --editable .` 済みなら、以下はどのディレクトリからでも実行できます
+（`data/` `db/` `config/` などの相対パスはプロジェクトルート基準で解決されます）。
 サブコマンド一覧は `blnx --help` を参照してください。
 
 ```bash
 # インポート
-uv run python scripts/run_import.py inbox         # data/ 直下の CSV を自動判別インポート（推奨）
-uv run python scripts/run_import.py all           # 全データ（SBI証券除く）
-uv run python scripts/run_import_status.py        # 取込状況（ウォーターマーク）
+blnx import inbox         # data/ 直下の CSV を自動判別インポート（推奨）
+blnx import all           # 全データ（SBI証券除く）
+blnx import-status        # 取込状況（ウォーターマーク）
 
 # 分類
-uv run python scripts/run_categorize.py           # 辞書ベース自動分類
-uv run python scripts/run_ai_training.py          # ML分類モデルの学習
-uv run python scripts/run_ai_prediction.py        # ML分類の実行
-uv run python scripts/run_manual_labeling.py      # 手動ラベリングGUI
+blnx categorize           # 辞書ベース自動分類
+blnx ai-train             # ML分類モデルの学習
+blnx ai-predict           # ML分類の実行
+blnx manual-label         # 手動ラベリングGUI
 
 # 財務諸表・レポート
-uv run python scripts/run_balance_sheet.py        # 貸借対照表（資産・負債・純資産）
-uv run python scripts/run_cashflow_statement.py   # キャッシュフロー計算書
-uv run python scripts/run_monthly_report.py       # 月次支出グラフ
-uv run python scripts/run_interactive_report.py   # インタラクティブダッシュボード
-uv run python scripts/run_detect_subscriptions.py # 定期支出（サブスク）の検出
+blnx balance-sheet        # 貸借対照表（資産・負債・純資産）
+blnx cashflow             # キャッシュフロー計算書
+blnx monthly-report       # 月次支出グラフ
+blnx interactive-report   # インタラクティブダッシュボード
+blnx detect-subscriptions # 定期支出（サブスク）の検出
+
+# 書類（契約書・明細の原本保管）
+blnx docs add <file> --source <取得元> --kind bookkeeping|reference
+blnx docs list            # 保管済み一覧（--kind で絞り込み）
 ```
 
 ## ディレクトリ構成

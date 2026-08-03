@@ -3,8 +3,8 @@ SBI証券CSVウォッチャー
 data/raw/sbi_sec/ にCSVファイルが追加されたら自動的にインポートを実行する。
 
 使い方:
-    uv run python scripts/watch_sbi_sec.py          # 監視開始
-    uv run python scripts/watch_sbi_sec.py --once   # 既存ファイルを処理して終了
+    blnx watch-sbi-sec          # 監視開始
+    blnx watch-sbi-sec --once   # 既存ファイルを処理して終了
 """
 
 import sys

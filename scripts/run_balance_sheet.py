@@ -2,8 +2,8 @@
 貸借対照表 (Balance Sheet) スナップショット実行スクリプト
 
 使用例:
-  uv run python scripts/run_balance_sheet.py                # 今日時点
-  uv run python scripts/run_balance_sheet.py -d 2026-03-31  # 指定日時点
+  blnx balance-sheet                # 今日時点
+  blnx balance-sheet -d 2026-03-31  # 指定日時点
 """
 import argparse
 import sys

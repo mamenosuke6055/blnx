@@ -1,6 +1,6 @@
 """手動分類を辞書に還元する実行スクリプト（フィードバックループ）。
 
-    uv run python scripts/sync_manual_to_dictionary.py
+    blnx sync-manual-dictionary
 
 手動分類（finance.db）→ 辞書（dictionary.db）。実行後は
 ``run_categorize.py`` が来月以降の新規取引を自動分類できるようになる。
