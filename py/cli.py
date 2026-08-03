@@ -45,6 +45,9 @@ COMMAND_GROUPS = {
         "rebalance": ("scripts/run_rebalance.py", "ポートフォリオ・リバランス計算"),
         "update-exchange-rates": ("scripts/update_exchange_rates.py", "USD/JPY 為替レートの取得・保存"),
     },
+    "書類": {
+        "docs": ("scripts/run_documents.py", "契約書類・明細の生ファイル保管(add/list/export)"),
+    },
     "初期化": {
         "init-db": ("py/init/init_db.py", "finance.db のスキーマ初期化"),
         "init-dictionary-schema": ("py/init/init_dictionary_schema.py", "分類辞書スキーマの初期化"),
