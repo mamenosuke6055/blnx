@@ -208,10 +208,21 @@ def import_rakuten_asset_balance(csv_path: Path):
              if res: account_guid = res[0]
         
         if not account_guid:
-            cursor.execute("SELECT guid FROM accounts WHERE name = ?", (name,))
+            # 名前検索は必ず楽天証券の枠内に限定する。DB 全体から拾うと、同名口座が
+            # 他ブローカー/他階層にあるとき任意の 1 件に当たり、時価スナップが
+            # 無関係な口座へ付く（迷子口座の発生源。scripts/merge_orphan_investment_
+            # accounts.py で 2026-08-09 に 5 件を統合、fossil 5826f95c93 と同型）。
+            cursor.execute(
+                """
+                SELECT a.guid FROM accounts a
+                JOIN accounts p ON a.parent_guid = p.guid
+                WHERE a.name = ? AND p.name = 'Rakuten Securities'
+                """,
+                (name,),
+            )
             res = cursor.fetchone()
             if res: account_guid = res[0]
-            
+
         # If account not found, we can create it or skip.
         # For snapshots, better to create if we want to track everything.
         if not account_guid:
