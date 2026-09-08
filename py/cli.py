@@ -21,6 +21,7 @@ COMMAND_GROUPS = {
         "import-status": ("scripts/run_import_status.py", "取込状況(ウォーターマーク)を表示"),
         "watch-sbi-sec": ("scripts/watch_sbi_sec.py", "SBI証券 CSV の投入を監視して自動取込(--once で一括)"),
         "replay": ("scripts/run_replay.py", "アーカイブ済み CSV からの再取込(リプレイ)"),
+        "declare-account": ("scripts/run_account_declare.py", "口座宣言(CSVに口座が無い住信SBI等。--list/--pending)"),
     },
     "分類": {
         "categorize": ("scripts/run_categorize.py", "辞書ベースの自動分類"),

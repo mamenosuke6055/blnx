@@ -1,4 +1,7 @@
 import pandas as pd
+
+from py.importers import account_identity, raw_archive
+from py.importers.account_identity import AccountUndetermined
 import sqlite3
 import json
 from pathlib import Path
@@ -96,95 +99,119 @@ def import_dneobank_csv(
     csv_path: Path,
     account_path: list[str] = None,
     fitid_prefix: str = 'DNEOBANK',
+    account_key: str = None,
+    db_path: str = None,
+    raw_db_path: str = None,
 ):
     """
     住信SBIネット銀行の入出金明細CSVを読み込み、DBに登録します。
 
-    account_path: 銀行口座の階層パス。デフォルトは代表口座
-        (['Assets', 'Bank', 'SBI Sumishin Net Bank'])。
-        ハイブリ預金や目的別口座を取り込む場合は呼び出し側で指定する。
-    fitid_prefix: ofx_fitid 生成時のプレフィックス。account_path と組で口座ごとに
-        ユニークにし、別口座間で同一明細が衝突しないようにする。
+    口座は CSV に書かれていないため、`account_identity` で同定する(通貨ヘッダ +
+    相手口座名の排除 + 残高連鎖)。判定できなければ `AccountUndetermined` を送出して
+    **取込を拒否**する —— 代表口座へ固定で流し込む旧挙動は口座混入の原因だった。
+
+    account_key: 同定を省いて口座を指定する(人の宣言・リプレイ用)。
+    account_path / fitid_prefix: 旧シグネチャ互換。account_path を明示すると
+        同定を行わずその口座に記帳する(fitid は v1 のまま)。
     """
-    if account_path is None:
-        account_path = ['Assets', 'Bank', 'SBI Sumishin Net Bank']
+    raw_conn = raw_archive.open_raw_db(Path(raw_db_path) if raw_db_path else None)
+    try:
+        return _import_dneobank_csv(csv_path, account_path, fitid_prefix,
+                                    account_key, raw_conn, db_path)
+    finally:
+        raw_conn.close()
+
+
+def _import_dneobank_csv(csv_path, account_path, fitid_prefix, account_key, raw_conn,
+                         db_path=None):
+    legacy_mode = account_path is not None and account_key is None
     PROJECT_ROOT = get_project_root()
-    CONFIG_FILE = PROJECT_ROOT / "config/settings.json"
-    
-    try:
-        with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-            settings = json.load(f)
-        db_path = settings.get("db_path")
-        if not db_path:
-            print(f"エラー: db_pathが設定ファイルに見つかりません。")
+    if db_path is None:
+        CONFIG_FILE = PROJECT_ROOT / "config/settings.json"
+        try:
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                settings = json.load(f)
+            db_path = settings.get("db_path")
+            if not db_path:
+                print(f"エラー: db_pathが設定ファイルに見つかりません。")
+                return
+        except FileNotFoundError:
+            print(f"エラー: 設定ファイル '{CONFIG_FILE}' が見つかりません。")
             return
-    except FileNotFoundError:
-        print(f"エラー: 設定ファイル '{CONFIG_FILE}' が見つかりません。")
+        db_path = PROJECT_ROOT / db_path
+
+    # --- 生CSVの読みと口座同定 ---------------------------------------------
+    # 通貨は列名(円/USD)で判別する。旧実装は 残高(円) 固定だったため USD 建て
+    # ファイルが全行ゼロに落ち、$75 が ¥75 として代表口座に記帳されていた。
+    parsed = account_identity.parse_dneobank(
+        account_identity._decode(Path(csv_path).read_bytes()))
+    if parsed is None:
+        print(f"エラー: '{csv_path.name}' を住信SBIの明細として読めませんでした。")
         return
 
-    encoding = guess_encoding(csv_path)
-    if not encoding:
-        print(f"エラー: '{csv_path.name}' の文字コードを特定できませんでした。")
-        return
-    print(f"'{csv_path.name}' の文字コードは {encoding} と推測されました。")
-
-    try:
-        # 住信SBIネット銀行のCSVはヘッダーが1行目にある前提
-        # カラム: 日付, 内容, 出金金額(円), 入金金額(円), 残高(円), メモ
-        df = pd.read_csv(csv_path, encoding=encoding)
-        
-        # カラム名のマッピング確認
-        # 実際のカラム名に合わせて調整
-        column_map = {}
-        for col in df.columns:
-            if '日付' in col: column_map[col] = 'date'
-            elif '内容' in col: column_map[col] = 'description'
-            elif '出金金額' in col: column_map[col] = 'withdrawal'
-            elif '入金金額' in col: column_map[col] = 'deposit'
-            elif '残高' in col: column_map[col] = 'balance'
-            elif 'メモ' in col: column_map[col] = 'memo'
-        
-        df.rename(columns=column_map, inplace=True)
-        
-        required_cols = ['date', 'description', 'withdrawal', 'deposit']
-        if not all(col in df.columns for col in required_cols):
-            print(f"エラー: 必要なカラムが見つかりません。検出されたカラム: {df.columns.tolist()}")
-            return
-
-    except Exception as e:
-        print(f"エラー: CSVファイルの読み込みに失敗しました: {e}")
-        return
-
-    # 日付変換
-    df['date'] = pd.to_datetime(df['date'], errors='coerce').dt.strftime('%Y-%m-%d')
-    df.dropna(subset=['date'], inplace=True)
-    
-    # 金額処理
-    df['withdrawal'] = df['withdrawal'].apply(parse_amount)
-    df['deposit'] = df['deposit'].apply(parse_amount)
-    if 'balance' in df.columns:
-        df['balance'] = df['balance'].apply(parse_amount)
+    reg = account_identity.registry(raw_conn)
+    if legacy_mode:
+        resolved_path, denom, currency = account_path, 1, 'JPY'
+        reason = '呼び出し側の指定(旧シグネチャ)'
     else:
-        df['balance'] = 0
+        if account_key is None:
+            sha = hashlib.sha256(Path(csv_path).read_bytes()).hexdigest()
+            ident = account_identity.identify(raw_conn, parsed, exclude_sha=sha)
+            if not ident.decided:
+                # 推測して記帳しない。取込拒否(indeterminate)。
+                raise AccountUndetermined(ident.reason, ident.candidates)
+            account_key = ident.account_key
+            reason = ident.reason
+            account_identity.declare(raw_conn, sha, account_key,
+                                     origin='chain', evidence=reason)
+        else:
+            reason = '指定'
+        if account_key not in reg:
+            raise AccountUndetermined(f'未登録の口座キー: {account_key}')
+        resolved_path = reg[account_key]['account_path']
+        currency = reg[account_key]['currency']
+        denom = parsed.denom
+        print(f"口座同定: {reg[account_key]['label']} ({account_key}) — 根拠: {reason}")
 
-    # 1行ごとの処理用データ作成
-    # deposit > 0 なら入金、withdrawal > 0 なら出金
-    
-    def generate_fitid(row):
-        # ユニークID生成
-        # 同じ日付、同じ内容、同じ金額の場合でも区別したいが、CSVに行番号がないため
-        # balanceを含めることでユニーク性を高める
-        raw_str = f"{fitid_prefix}:{row['date']}:{row['description']}:{row['withdrawal']}:{row['deposit']}:{row['balance']}"
-        return 'SHA256:' + hashlib.sha256(raw_str.encode()).hexdigest()
-
-    df['ofx_fitid'] = df.apply(generate_fitid, axis=1)
-    
-    # 重複除外 (CSV内)
+    # --- 行の組み立て(fitid は v1 互換 + v2 を両方持つ) ---------------------
+    # v1 = 旧実装の式(口座を含まない。既存 4,167 件との突合にのみ使う)
+    # v2 = 口座キー・通貨・ファイル内連番を含む決定的関数(これから書く値)
+    seen = {}
+    records = []
+    for idx, (date, desc, amt_minor, bal_minor) in enumerate(parsed.rows):
+        if amt_minor == 0:
+            continue
+        key = (date, desc, amt_minor)
+        seen[key] = seen.get(key, 0) + 1
+        withdrawal_v1 = (-amt_minor if amt_minor < 0 else 0) / denom
+        deposit_v1 = (amt_minor if amt_minor > 0 else 0) / denom
+        v1_src = (f"{fitid_prefix}:{date}:{desc}:"
+                  f"{int(withdrawal_v1) if withdrawal_v1 == int(withdrawal_v1) else withdrawal_v1}:"
+                  f"{int(deposit_v1) if deposit_v1 == int(deposit_v1) else deposit_v1}:"
+                  f"{int(bal_minor / denom) if (bal_minor / denom) == int(bal_minor / denom) else bal_minor / denom}")
+        v2_src = (f"v2:dneobank:{account_key or ':'.join(resolved_path)}:{currency}:"
+                  f"{date}:{desc}:{amt_minor}:{bal_minor}:{seen[key]}")
+        records.append({
+            'date': date, 'description': desc,
+            'deposit': amt_minor if amt_minor > 0 else 0,
+            'withdrawal': -amt_minor if amt_minor < 0 else 0,
+            'ofx_fitid': 'SHA256:' + hashlib.sha256(v2_src.encode()).hexdigest(),
+            'fitid_v1': 'SHA256:' + hashlib.sha256(v1_src.encode()).hexdigest(),
+        })
+    if legacy_mode:
+        # 旧挙動: v1 を書き込む(既存データとの互換)
+        for r in records:
+            r['ofx_fitid'] = r['fitid_v1']
+    df = pd.DataFrame(records)
+    if df.empty:
+        print(f"'{csv_path.name}' に取込対象の明細行がありませんでした。")
+        return
     df.drop_duplicates(subset=['ofx_fitid'], keep='first', inplace=True)
+    account_path = resolved_path
 
     conn = None
     try:
-        conn = sqlite3.connect(PROJECT_ROOT / db_path)
+        conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
         
         # --- 勘定科目設定 ---
@@ -203,7 +230,7 @@ def import_dneobank_csv(
             for keyword, account_path in CARD_PAYMENT_PATTERNS
         }
         
-        jpy_guid = get_currency_guid(conn, 'JPY')
+        currency_guid = get_currency_guid(conn, currency)
         
         conn.commit()
 
@@ -222,7 +249,8 @@ def import_dneobank_csv(
         
         # 古い順に並んでいる可能性もあるが、CSVの順序通り処理
         for _, row in df.iterrows():
-            if row['ofx_fitid'] in existing_ids:
+            # v2 で書くが、v1(旧式)で既に入っている行は再取込しない(hash policy=auto)
+            if row['ofx_fitid'] in existing_ids or row['fitid_v1'] in existing_ids:
                 continue
                 
             deposit = row['deposit']
@@ -241,7 +269,7 @@ def import_dneobank_csv(
                 cursor.execute("""
                     INSERT INTO transactions (guid, post_date, description, ofx_fitid, currency_guid)
                     VALUES (?, ?, ?, ?, ?)
-                """, (tx_guid, post_date, description, row['ofx_fitid'], jpy_guid))
+                """, (tx_guid, post_date, description, row['ofx_fitid'], currency_guid))
                 
                 # Split登録
                 # 金額は 100倍とかせず、そのまま (Integer/Rational管理なら分母1でOK)
@@ -265,14 +293,14 @@ def import_dneobank_csv(
                     # 借方 (Debit): 資産増加 (+amount)
                     cursor.execute("""
                         INSERT INTO splits (guid, tx_guid, account_guid, value_num, value_denom, quantity_num, quantity_denom)
-                        VALUES (?, ?, ?, ?, 1, ?, 1)
-                    """, (split1_guid, tx_guid, bank_account_guid, amount, amount))
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, (split1_guid, tx_guid, bank_account_guid, amount, denom, amount, denom))
                     
                     # 貸方 (Credit): 収益増加 (-amount) ※本スキーマでは収益・負債・資本の増加はマイナス表記
                     cursor.execute("""
                         INSERT INTO splits (guid, tx_guid, account_guid, value_num, value_denom, quantity_num, quantity_denom)
-                        VALUES (?, ?, ?, ?, 1, ?, 1)
-                    """, (split2_guid, tx_guid, peer_guid, -amount, -amount))
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, (split2_guid, tx_guid, peer_guid, -amount, denom, -amount, denom))
                     
                 else: # withdrawal > 0
                     amount = withdrawal
@@ -285,13 +313,13 @@ def import_dneobank_csv(
                     # 借方: 費用増加 or 負債減少 (+amount)
                     cursor.execute("""
                         INSERT INTO splits (guid, tx_guid, account_guid, value_num, value_denom, quantity_num, quantity_denom)
-                        VALUES (?, ?, ?, ?, 1, ?, 1)
-                    """, (split1_guid, tx_guid, debit_account_guid, amount, amount))
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, (split1_guid, tx_guid, debit_account_guid, amount, denom, amount, denom))
                     # 貸方: 資産減少 (-amount)
                     cursor.execute("""
                         INSERT INTO splits (guid, tx_guid, account_guid, value_num, value_denom, quantity_num, quantity_denom)
-                        VALUES (?, ?, ?, ?, 1, ?, 1)
-                    """, (split2_guid, tx_guid, bank_account_guid, -amount, -amount))
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, (split2_guid, tx_guid, bank_account_guid, -amount, denom, -amount, denom))
 
                 conn.commit()
                 new_transactions += 1

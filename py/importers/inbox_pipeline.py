@@ -26,6 +26,7 @@ from py.importers import import_sbi_sec
 from py.importers import import_resona_bank
 from py.importers.detect_source import detect_source, ignored_report
 from py.importers import raw_archive
+from py.importers.account_identity import AccountUndetermined
 from py.importers import import_gate
 from py.analysis.import_watermark import compute_watermarks, render_table
 
@@ -66,7 +67,7 @@ def process_inbox_file(csv_file: Path, db_path: Path, raw_conn: sqlite3.Connecti
     """
     record = {"file": csv_file.name, "source": None, "archived": False,
               "duplicate_file": False, "new_tx": None, "imported": False, "error": None,
-              "ignored": False, "period": None, "period_overlap": []}
+              "ignored": False, "pending": False, "period": None, "period_overlap": []}
 
     # 取込対象外と分かっている SBI レポート類は detect_source より前に拾い、
     # 「種別不明」でなく『対象外・代替・今後DL不要』を明示する。
@@ -106,6 +107,15 @@ def process_inbox_file(csv_file: Path, db_path: Path, raw_conn: sqlite3.Connecti
     before = _count_transactions(db_path)
     try:
         _import_one(csv_file, source, db_path)
+    except AccountUndetermined as e:
+        # 口座を判定できない = indeterminate。推測して記帳せず拒否する。
+        # 生CSVは既に archive 済みなので、宣言を足して再取込すれば復帰できる。
+        record["pending"] = True
+        record["error"] = (f"取込拒否(口座を判定できない): {e.reason}"
+                           + (f" / 候補: {'・'.join(e.candidates)}" if e.candidates else "")
+                           + f"\n      → blnx declare-account --file {csv_file.name} "
+                             f"--account <口座キー> で宣言してから再取込")
+        return record
     except Exception as e:
         record["error"] = f"取込失敗: {e}"
         return record
@@ -144,7 +154,8 @@ def run_inbox_import(inbox_dir: Path, db_path: Path, processed_dir: Path | None 
                 print(f"  [対象外] {csv_file.name} — {rec['error']}")
                 continue
             if rec["error"]:
-                print(f"  [スキップ/{rec['source'] or '不明'}] {csv_file.name} — {rec['error']}")
+                tag = "保留" if rec["pending"] else "スキップ"
+                print(f"  [{tag}/{rec['source'] or '不明'}] {csv_file.name} — {rec['error']}")
                 continue
             dup = "（再DL・既知ファイル）" if rec["duplicate_file"] else ""
             print(f"  [{rec['source']}] {csv_file.name} — 新規 {rec['new_tx']} 件{dup}")
@@ -163,11 +174,15 @@ def run_inbox_import(inbox_dir: Path, db_path: Path, processed_dir: Path | None 
 
     ok = [r for r in records if r["imported"]]
     ignored = [r for r in records if r["ignored"]]
-    skipped = [r for r in records if not r["imported"] and not r["ignored"]]
+    pending = [r for r in records if r["pending"]]
+    skipped = [r for r in records if not r["imported"] and not r["ignored"]
+               and not r["pending"]]
     total_new = sum(r["new_tx"] for r in ok)
     summary = f"\n取込完了: {len(ok)} ファイル / 新規 {total_new} 件"
     if ignored:
         summary += f" / 対象外 {len(ignored)} ファイル"
+    if pending:
+        summary += f" / 保留(口座不明) {len(pending)} ファイル"
     if skipped:
         summary += f" / スキップ {len(skipped)} ファイル"
     print(summary)
