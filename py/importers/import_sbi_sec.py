@@ -12,11 +12,13 @@ import unicodedata
 from difflib import SequenceMatcher
 from datetime import datetime
 
+from py.importers import ledger
 from py.importers._cost_basis import (
     calc_moving_avg_cost_per_unit,
     get_capital_gain_account_guid,
     get_capital_loss_account_guid,
     build_sell_splits,
+    sell_entries,
 )
 
 def get_project_root() -> Path:
@@ -560,6 +562,7 @@ def import_sbi_domestic_trade_history(csv_path: Path):
     conn.commit()
 
     new_tx_count = 0
+    seq = ledger.SeqCounter()
 
     for _, row in df.iterrows():
         trade_date = parse_sbi_date(str(row['約定日']))
@@ -581,14 +584,12 @@ def import_sbi_domestic_trade_history(csv_path: Path):
             conn, ['Assets', 'Investments', 'SBI Securities', account_type, fund_name], 'ASSET', 'INVESTMENT'
         )
 
-        # FITID
-        raw_str = f"SBISEC_DOM:{trade_date}:{fund_name}:{tx_type_raw}:{units}:{settlement}"
-        fitid = 'SHA256:' + hashlib.sha256(raw_str.encode()).hexdigest()
-        cursor.execute("SELECT 1 FROM transactions WHERE ofx_fitid = ?", (fitid,))
-        if cursor.fetchone():
-            continue
+        # v1(旧実装の式)。既存行との突合にのみ使う
+        legacy = 'SHA256:' + hashlib.sha256(
+            f"SBISEC_DOM:{trade_date}:{fund_name}:{tx_type_raw}:{units}:{settlement}".encode()
+        ).hexdigest()
 
-        # 取引種別判別を INSERT 前に行う。対応外種別はここでスキップする。
+        # 取引種別判別を記帳前に行う。対応外種別はここでスキップする。
         # 以前は INSERT 後に conn.rollback() で巻き戻す実装だったが、
         # commit はループ後の1回のみのため、Unknown 1件で**それまで保存した全 tx も
         # 巻き戻す**バグがあった (fd 0280bc08 で発覚: 217件CSV取込で 217件中分配金再投資2件が原因で
@@ -600,45 +601,29 @@ def import_sbi_domestic_trade_history(csv_path: Path):
             print(f"Unknown tx type: {tx_type_raw}")
             continue
 
-        tx_guid = uuid.uuid4().hex
         desc = f"{tx_type_raw} {fund_name}"
-        cursor.execute("""
-            INSERT INTO transactions (guid, post_date, description, ofx_fitid, currency_guid)
-            VALUES (?, ?, ?, ?, ?)
-        """, (tx_guid, trade_date, desc, fitid, jpy_guid))
 
         if is_reinvest:
-            # Debit: Security (increase), Credit: Income:Dividend
-            cursor.execute("""
-                INSERT INTO splits (guid, tx_guid, account_guid, value_num, value_denom, quantity_num, quantity_denom)
-                VALUES (?, ?, ?, ?, 1, ?, 10000)
-            """, (uuid.uuid4().hex, tx_guid, security_account, int(settlement), int(units * 10000)))
-            cursor.execute("""
-                INSERT INTO splits (guid, tx_guid, account_guid, value_num, value_denom, quantity_num, quantity_denom)
-                VALUES (?, ?, ?, ?, 1, ?, 1)
-            """, (uuid.uuid4().hex, tx_guid, income_div_account, -int(settlement), -int(settlement)))
+            # 借方: ファンド(増) / 貸方: Income:Dividend。現金は動かない
+            entries = (
+                ledger.Entry(security_account, int(settlement), 1, int(units * 10000), 10000),
+                ledger.Entry(income_div_account, -int(settlement), 1, -int(settlement), 1),
+            )
             inv_type = 'REINVEST'
         elif is_buy:
-            # Debit: Security (increase), Credit: Cash (decrease)
-            cursor.execute("""
-                INSERT INTO splits (guid, tx_guid, account_guid, value_num, value_denom, quantity_num, quantity_denom)
-                VALUES (?, ?, ?, ?, 1, ?, 10000)
-            """, (uuid.uuid4().hex, tx_guid, security_account, int(settlement), int(units * 10000)))
-            cursor.execute("""
-                INSERT INTO splits (guid, tx_guid, account_guid, value_num, value_denom, quantity_num, quantity_denom)
-                VALUES (?, ?, ?, ?, 1, ?, 1)
-            """, (uuid.uuid4().hex, tx_guid, cash_account, -int(settlement), -int(settlement)))
+            # 借方: ファンド(増) / 貸方: 現金(減)
+            entries = (
+                ledger.Entry(security_account, int(settlement), 1, int(units * 10000), 10000),
+                ledger.Entry(cash_account, -int(settlement), 1, -int(settlement), 1),
+            )
             inv_type = 'BUY'
-        elif is_sell:  # H1 修正: 3-way (Cash + Asset@cost + P/L)
+        else:  # 売却・解約 — 3-way (Cash + Asset@cost + P/L)
             cost_per_unit, _ = calc_moving_avg_cost_per_unit(conn, security_account, trade_date)
-            cap_gain = get_capital_gain_account_guid(conn)
-            cap_loss = get_capital_loss_account_guid(conn)
-            build_sell_splits(
-                cursor, tx_guid,
+            entries = sell_entries(
                 cash_account_guid=cash_account,
                 security_account_guid=security_account,
-                capital_gain_account_guid=cap_gain,
-                capital_loss_account_guid=cap_loss,
+                capital_gain_account_guid=get_capital_gain_account_guid(conn),
+                capital_loss_account_guid=get_capital_loss_account_guid(conn),
                 proceeds=settlement,
                 units=units,
                 cost_per_unit=cost_per_unit,
@@ -647,13 +632,17 @@ def import_sbi_domestic_trade_history(csv_path: Path):
             )
             inv_type = 'SELL'
 
-        inv_tx_guid = uuid.uuid4().hex
-        cursor.execute("""
-            INSERT INTO investment_transactions (guid, tx_guid, security_guid, type, units, unit_price, total_amount, currency_guid, trade_date, settle_date)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (inv_tx_guid, tx_guid, security_account, inv_type, units, unit_price, settlement, jpy_guid, trade_date, settle_date))
-
-        new_tx_count += 1
+        posted = ledger.post(conn, ledger.Posting(
+            source="sbi_sec", account_key=f"domestic:{account_type}",
+            date=trade_date, description=desc, amount=settlement,
+            seq=seq.next(trade_date, desc, settlement),
+            entries=entries, currency_guid=jpy_guid,
+            investment={"security_guid": security_account, "type": inv_type, "units": units,
+                        "unit_price": unit_price, "total_amount": settlement,
+                        "trade_date": trade_date, "settle_date": settle_date},
+            legacy_fitids=(legacy,)))
+        if posted is not None:
+            new_tx_count += 1
 
     conn.commit()
     conn.close()
@@ -737,7 +726,8 @@ def import_sbi_deposit_withdrawal(csv_path: Path):
     conn.commit()
 
     new_tx_count = 0
-    
+    seq = ledger.SeqCounter()
+
     for _, row in df.iterrows():
         date = parse_sbi_date(row['入出金日'])
         if not date: continue
@@ -763,39 +753,25 @@ def import_sbi_deposit_withdrawal(csv_path: Path):
         else:
             continue
 
-        # Generate FITID
-        # D/W dont have unique IDs in CSV. Use hash of fields.
-        raw_str = f"SBISEC_DW:{date}:{desc}:{amount}:{currency}"
-        fitid = 'SHA256:' + hashlib.sha256(raw_str.encode()).hexdigest()
-        
-        # Check duplicate
-        cursor.execute("SELECT 1 FROM transactions WHERE ofx_fitid = ?", (fitid,))
-        if cursor.fetchone():
-            continue
+        # 入出金は CSV に一意な ID を持たないので、内容から鍵を作る
+        legacy = 'SHA256:' + hashlib.sha256(
+            f"SBISEC_DW:{date}:{desc}:{amount}:{currency}".encode()).hexdigest()
 
-        # Insert Transaction
-        tx_guid = uuid.uuid4().hex
-        cursor.execute("""
-            INSERT INTO transactions (guid, post_date, description, ofx_fitid, currency_guid)
-            VALUES (?, ?, ?, ?, ?)
-        """, (tx_guid, date, desc, fitid, usd_guid))
-        
-        # Split 1: SBI Sec USD (Main)
-        split1_guid = uuid.uuid4().hex
-        cursor.execute("""
-            INSERT INTO splits (guid, tx_guid, account_guid, value_num, value_denom, quantity_num, quantity_denom)
-            VALUES (?, ?, ?, ?, 100, ?, 100)
-        """, (split1_guid, tx_guid, sbi_usd_cash_account, int(amount * 100), int(amount * 100)))
+        posted = ledger.post(conn, ledger.Posting(
+            source="sbi_sec", account_key="cash_usd",
+            date=date, description=desc, amount=amount,
+            seq=seq.next(date, desc, amount),
+            entries=(
+                # Split 1: SBI Sec USD (Main) / Split 2: Peer (Bank or Transfer)
+                ledger.Entry(sbi_usd_cash_account, int(amount * 100), 100,
+                             int(amount * 100), 100),
+                ledger.Entry(peer_account_guid, int(-amount * 100), 100,
+                             int(-amount * 100), 100),
+            ),
+            currency_guid=usd_guid, legacy_fitids=(legacy,)))
+        if posted is not None:
+            new_tx_count += 1
 
-        # Split 2: Peer (Bank or Transfer)
-        split2_guid = uuid.uuid4().hex
-        cursor.execute("""
-            INSERT INTO splits (guid, tx_guid, account_guid, value_num, value_denom, quantity_num, quantity_denom)
-            VALUES (?, ?, ?, ?, 100, ?, 100)
-        """, (split2_guid, tx_guid, peer_account_guid, int(-amount * 100), int(-amount * 100)))
-
-        new_tx_count += 1
-    
     conn.commit()
     conn.close()
     print(f"Imported {new_tx_count} transactions from {csv_path.name}")
@@ -832,6 +808,7 @@ def import_sbi_trade_history(csv_path: Path):
     conn.commit()
 
     new_tx_count = 0
+    seq = ledger.SeqCounter()
 
     for _, row in df.iterrows():
         trade_date = parse_sbi_date(row['国内約定日'])
@@ -859,100 +836,62 @@ def import_sbi_trade_history(csv_path: Path):
             conn, ['Assets', 'Investments', 'SBI Securities', security_name], 'ASSET', 'INVESTMENT'
         )
 
-        # Generate FITID
-        raw_str = f"SBISEC_TRADE:{trade_date}:{security_name}:{tx_type}:{units}:{total_amount}"
-        fitid = 'SHA256:' + hashlib.sha256(raw_str.encode()).hexdigest()
-        
-        cursor.execute("SELECT 1 FROM transactions WHERE ofx_fitid = ?", (fitid,))
-        if cursor.fetchone():
-            continue
+        # v1(旧実装の式)。既存行との突合にのみ使う
+        legacy = 'SHA256:' + hashlib.sha256(
+            f"SBISEC_TRADE:{trade_date}:{security_name}:{tx_type}:{units}:{total_amount}".encode()
+        ).hexdigest()
 
-        # Insert Transaction
-        tx_guid = uuid.uuid4().hex
         desc = f"{tx_type} {security_name}"
-        cursor.execute("""
-            INSERT INTO transactions (guid, post_date, description, ofx_fitid, currency_guid)
-            VALUES (?, ?, ?, ?, ?)
-        """, (tx_guid, trade_date, desc, fitid, ccy_guid))
 
-        # Determine logic based on type
-        # '再投資' (Reinvest) -> Income:Dividend -> Security
-        # '買付' (Buy) -> Bank/Cash -> Security
-        # '売却' (Sell) -> Security -> Bank/Cash
-        
-        split_asset_guid = uuid.uuid4().hex
-        split_funding_guid = uuid.uuid4().hex
-        
+        # '再投資' -> Income:Dividend -> Security / '買付' -> Cash -> Security
+        # '売却' -> Security -> Cash (3-way)
         if tx_type == '再投資':
-            # Debit Security (Increase)
-            cursor.execute("""
-                INSERT INTO splits (guid, tx_guid, account_guid, value_num, value_denom, quantity_num, quantity_denom)
-                VALUES (?, ?, ?, ?, 100, ?, 10000)
-            """, (split_asset_guid, tx_guid, security_account, int(total_amount * 100), int(units * 10000)))
-            
-            # Credit Income (Increase in Income = Credit)
-            cursor.execute("""
-                INSERT INTO splits (guid, tx_guid, account_guid, value_num, value_denom, quantity_num, quantity_denom)
-                VALUES (?, ?, ?, ?, 100, ?, 100)
-            """, (split_funding_guid, tx_guid, income_div_account, int(-total_amount * 100), int(-total_amount * 100)))
-            
-            # Investment Transaction Record
-            inv_tx_guid = uuid.uuid4().hex
-            cursor.execute("""
-                INSERT INTO investment_transactions (guid, tx_guid, security_guid, type, units, unit_price, total_amount, currency_guid, trade_date, settle_date)
-                VALUES (?, ?, ?, 'REINVEST', ?, ?, ?, ?, ?, ?)
-            """, (inv_tx_guid, tx_guid, security_account, units, unit_price, total_amount, ccy_guid, trade_date, settle_date))
-
+            entries = (
+                ledger.Entry(security_account, int(total_amount * 100), 100,
+                             int(units * 10000), 10000),
+                ledger.Entry(income_div_account, int(-total_amount * 100), 100,
+                             int(-total_amount * 100), 100),
+            )
+            inv_type = 'REINVEST'
         elif tx_type == '買付':
-            # Debit Security (Increase)
-            cursor.execute("""
-                INSERT INTO splits (guid, tx_guid, account_guid, value_num, value_denom, quantity_num, quantity_denom)
-                VALUES (?, ?, ?, ?, 100, ?, 10000)
-            """, (split_asset_guid, tx_guid, security_account, int(total_amount * 100), int(units * 10000)))
-
-            # Credit Bank (Decrease)
-            cursor.execute("""
-                INSERT INTO splits (guid, tx_guid, account_guid, value_num, value_denom, quantity_num, quantity_denom)
-                VALUES (?, ?, ?, ?, 100, ?, 100)
-            """, (split_funding_guid, tx_guid, cash_account, int(-total_amount * 100), int(-total_amount * 100)))
-
-            # Investment Transaction Record
-            inv_tx_guid = uuid.uuid4().hex
-            cursor.execute("""
-                INSERT INTO investment_transactions (guid, tx_guid, security_guid, type, units, unit_price, total_amount, currency_guid, trade_date, settle_date)
-                VALUES (?, ?, ?, 'BUY', ?, ?, ?, ?, ?, ?)
-            """, (inv_tx_guid, tx_guid, security_account, units, unit_price, total_amount, ccy_guid, trade_date, settle_date))
-
+            entries = (
+                ledger.Entry(security_account, int(total_amount * 100), 100,
+                             int(units * 10000), 10000),
+                ledger.Entry(cash_account, int(-total_amount * 100), 100,
+                             int(-total_amount * 100), 100),
+            )
+            inv_type = 'BUY'
         elif '売却' in tx_type or '売付' in tx_type:  # H2 修正: 元 importer に欠落していた sell 分岐
             # H1 修正: 3-way (Cash + Asset@cost + P/L)、value_denom=100 (USD cents)
             cost_per_unit, _ = calc_moving_avg_cost_per_unit(conn, security_account, trade_date)
-            cap_gain = get_capital_gain_account_guid(conn)
-            cap_loss = get_capital_loss_account_guid(conn)
-            build_sell_splits(
-                cursor, tx_guid,
+            entries = sell_entries(
                 cash_account_guid=cash_account,
                 security_account_guid=security_account,
-                capital_gain_account_guid=cap_gain,
-                capital_loss_account_guid=cap_loss,
+                capital_gain_account_guid=get_capital_gain_account_guid(conn),
+                capital_loss_account_guid=get_capital_loss_account_guid(conn),
                 proceeds=total_amount,
                 units=units,
                 cost_per_unit=cost_per_unit,
                 value_denom=100,
                 asset_qty_denom=10000,
             )
-            inv_tx_guid = uuid.uuid4().hex
-            cursor.execute("""
-                INSERT INTO investment_transactions (guid, tx_guid, security_guid, type, units, unit_price, total_amount, currency_guid, trade_date, settle_date)
-                VALUES (?, ?, ?, 'SELL', ?, ?, ?, ?, ?, ?)
-            """, (inv_tx_guid, tx_guid, security_account, units, unit_price, total_amount, ccy_guid, trade_date, settle_date))
-
+            inv_type = 'SELL'
         else:
             print(f"  Skipped unknown tx type: {tx_type}")
-            cursor.execute("DELETE FROM transactions WHERE guid = ?", (tx_guid,))
             continue
 
-        new_tx_count += 1
-    
+        posted = ledger.post(conn, ledger.Posting(
+            source="sbi_sec", account_key="trade:JPY" if is_jpy else "trade:USD",
+            date=trade_date, description=desc, amount=total_amount,
+            seq=seq.next(trade_date, desc, total_amount),
+            entries=entries, currency_guid=ccy_guid,
+            investment={"security_guid": security_account, "type": inv_type, "units": units,
+                        "unit_price": unit_price, "total_amount": total_amount,
+                        "trade_date": trade_date, "settle_date": settle_date},
+            legacy_fitids=(legacy,)))
+        if posted is not None:
+            new_tx_count += 1
+
     conn.commit()
     conn.close()
     print(f"Imported {new_tx_count} trades from {csv_path.name}")
@@ -1005,6 +944,7 @@ def import_sbi_jpy_deposit_withdrawal(csv_path: Path):
     conn.commit()
 
     new_count = 0
+    seq = ledger.SeqCounter()
     for _, row in df.iterrows():
         date = parse_sbi_date(row['入出金日'])
         if not date:
@@ -1020,11 +960,8 @@ def import_sbi_jpy_deposit_withdrawal(csv_path: Path):
 
         amount = in_amt if in_amt > 0 else -out_amt
 
-        raw = f"SBISEC_JPY_DW:{date}:{desc}:{in_amt}:{out_amt}"
-        fitid = 'SHA256:' + hashlib.sha256(raw.encode()).hexdigest()
-        cursor.execute("SELECT 1 FROM transactions WHERE ofx_fitid=?", (fitid,))
-        if cursor.fetchone():
-            continue
+        legacy = 'SHA256:' + hashlib.sha256(
+            f"SBISEC_JPY_DW:{date}:{desc}:{in_amt}:{out_amt}".encode()).hexdigest()
 
         # 対向口座の決定
         if '楽天銀行' in desc:
@@ -1036,23 +973,21 @@ def import_sbi_jpy_deposit_withdrawal(csv_path: Path):
         else:
             peer = expense_unc
 
-        tx_guid = uuid.uuid4().hex
-        cursor.execute(
-            "INSERT INTO transactions (guid, post_date, description, ofx_fitid, currency_guid) VALUES (?,?,?,?,?)",
-            (tx_guid, date, desc, fitid, jpy_guid)
-        )
-        cursor.execute(
-            "INSERT INTO splits (guid, tx_guid, account_guid, value_num, value_denom, quantity_num, quantity_denom) VALUES (?,?,?,?,1,?,1)",
-            (uuid.uuid4().hex, tx_guid, jpy_clearing, amount, amount)
-        )
         peer_amount = -amount
         if peer == tax_expense:
             peer_amount = out_amt  # 費用は正値
-        cursor.execute(
-            "INSERT INTO splits (guid, tx_guid, account_guid, value_num, value_denom, quantity_num, quantity_denom) VALUES (?,?,?,?,1,?,1)",
-            (uuid.uuid4().hex, tx_guid, peer, peer_amount, peer_amount)
-        )
-        new_count += 1
+
+        posted = ledger.post(conn, ledger.Posting(
+            source="sbi_sec", account_key="jpy_clearing",
+            date=date, description=desc, amount=amount,
+            seq=seq.next(date, desc, amount),
+            entries=(
+                ledger.Entry(jpy_clearing, int(amount), 1, int(amount), 1),
+                ledger.Entry(peer, int(peer_amount), 1, int(peer_amount), 1),
+            ),
+            currency_guid=jpy_guid, legacy_fitids=(legacy,)))
+        if posted is not None:
+            new_count += 1
 
     conn.commit()
     conn.close()

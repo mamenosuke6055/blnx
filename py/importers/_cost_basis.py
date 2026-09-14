@@ -91,6 +91,47 @@ def _get_or_create_pl_account(
     return parent_guid
 
 
+def sell_entries(
+    cash_account_guid: str,
+    security_account_guid: str,
+    capital_gain_account_guid: str,
+    capital_loss_account_guid: str,
+    proceeds: float,
+    units: float,
+    cost_per_unit: float,
+    value_denom: int = 1,
+    asset_qty_denom: int = 1,
+):
+    """売却の 3-way 明細を組み立てて返す(記帳サービスに渡す形)。
+
+    - Cash:    +proceeds                       (value/qty 同値、value_denom)
+    - Asset:   value=-cost_basis_used (value_denom), quantity=-units (asset_qty_denom)
+    - Income/Capital Gain or Expenses/Capital Loss: 差額 (value/qty 同値、value_denom)
+
+    proceeds と units は正の値で渡す (売却数量・受取金額)。
+    端数は P/L 側で吸収し、借貸が必ず一致するようにする。
+    """
+    from py.importers.ledger import Entry
+
+    cost_basis_used = units * cost_per_unit
+    proceeds_scaled = int(round(proceeds * value_denom))
+    cost_scaled = int(round(cost_basis_used * value_denom))
+    units_scaled = int(round(units * asset_qty_denom))
+    # 丸めたあとの差額を P/L に寄せる(丸め誤差で貸借が 1 円ずれるのを防ぐ)
+    realized_scaled = proceeds_scaled - cost_scaled
+
+    pl_account = (capital_gain_account_guid if realized_scaled >= 0
+                  else capital_loss_account_guid)
+    return (
+        Entry(cash_account_guid, proceeds_scaled, value_denom,
+              proceeds_scaled, value_denom),
+        Entry(security_account_guid, -cost_scaled, value_denom,
+              -units_scaled, asset_qty_denom),
+        Entry(pl_account, -realized_scaled, value_denom,
+              -realized_scaled, value_denom),
+    )
+
+
 def build_sell_splits(
     cursor: sqlite3.Cursor,
     tx_guid: str,

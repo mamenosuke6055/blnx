@@ -171,3 +171,41 @@ def test_import_creates_balanced_splits(tmp_path):
             assert s == 0  # 借貸ゼロサム
     finally:
         c.close()
+
+
+def test_import_keeps_two_identical_purchases_in_one_file(tmp_path):
+    """同日・同額・同店の**正当な 2 件**は両方残る(旧実装は 1 件に畳んでいた)。
+
+    速報版と確定版の二重取込を防ぐ正規化キーは「件数」で突合するので、
+    1 つのファイルに 2 本ある決済は 2 本入り、同じファイルを再取込しても増えない。
+    """
+    db = _make_db(tmp_path)
+    csvp = tmp_path / "enavi.csv"
+    _write_enavi(csvp, [
+        ("2025/06/12", "ｾﾌﾞﾝｲﾚﾌﾞﾝ", "500"),
+        ("2025/06/12", "ｾﾌﾞﾝｲﾚﾌﾞﾝ", "500"),
+    ])
+    import_rakuten_card_csv(csvp, str(db))
+    assert _tx_count(db) == 2
+
+    import_rakuten_card_csv(csvp, str(db))
+    assert _tx_count(db) == 2
+
+
+def test_confirmed_format_does_not_duplicate_two_identical_purchases(tmp_path):
+    """速報版で 2 件入っている決済が、確定版(表記ゆれ)で増えない。"""
+    db = _make_db(tmp_path)
+    early = tmp_path / "enavi_early.csv"
+    _write_enavi(early, [
+        ("2025/06/12", "ｾﾌﾞﾝｲﾚﾌﾞﾝ", "500"),
+        ("2025/06/12", "ｾﾌﾞﾝｲﾚﾌﾞﾝ", "500"),
+    ])
+    import_rakuten_card_csv(early, str(db))
+
+    confirmed = tmp_path / "enavi_confirmed.csv"
+    _write_enavi(confirmed, [
+        ("2025/06/12", "ＶＩＳＡ国内利用　VS ｾﾌﾞﾝｲﾚﾌﾞﾝ", "500"),
+        ("2025/06/12", "ＶＩＳＡ国内利用　VS ｾﾌﾞﾝｲﾚﾌﾞﾝ", "500"),
+    ])
+    import_rakuten_card_csv(confirmed, str(db))
+    assert _tx_count(db) == 2

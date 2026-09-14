@@ -18,9 +18,10 @@ HEADER = [
 ]
 
 
-def _row(record_type, txn_name, y, m, d, amount, balance, tekiyo):
+def _row(record_type, txn_name, y, m, d, amount, balance, tekiyo, account_no="1234567"):
     r = [""] * 21
     r[0] = record_type
+    r[11] = account_no
     r[13] = txn_name
     r[14], r[15], r[16] = y, m, d
     r[17] = amount
@@ -47,7 +48,7 @@ def test_parse_basic(tmp_path):
     assert len(txns) == 2
     assert txns[0] == {
         "date": "2026-05-01", "amount": 10000, "txn_name": "入金",
-        "description": "給与", "balance": "50,000",
+        "description": "給与", "balance": "50,000", "account_no": "1234567",
     }
     assert txns[1]["txn_name"] == "支払"
     assert txns[1]["amount"] == 3000
@@ -180,3 +181,50 @@ def test_import_unknown_income_stays_uncategorized(tmp_path):
     assert uncat is not None
     assert c.execute("SELECT SUM(value_num) FROM splits WHERE account_guid=?", (uncat,)).fetchone()[0] == -3640
     c.close()
+
+
+def test_import_survives_overlapping_redownload(tmp_path):
+    """期間が重なる 2 回目の DL で行番号がずれても二重計上しない。
+
+    鍵の連番は生の行番号ではなく「同じ (日付,摘要,金額) の何本目か」なので、
+    先頭に古い行が増えても、同じ取引には同じ番号が付く(記帳サービスの約束)。
+    """
+    db = _make_db(tmp_path)
+    first = tmp_path / "r1.csv"
+    _write_csv(first, [
+        _row("明細", "支払", "2026", "5", "2", "3,000", "47,000", "コンビニ"),
+        _row("明細", "支払", "2026", "5", "3", "1,200", "45,800", "カフェ"),
+    ])
+    import_resona_bank_csv(first, str(db))
+
+    second = tmp_path / "r2.csv"
+    _write_csv(second, [
+        _row("明細", "入金", "2026", "5", "1", "10,000", "50,000", "給与"),   # 先頭に追加
+        _row("明細", "支払", "2026", "5", "2", "3,000", "47,000", "コンビニ"),
+        _row("明細", "支払", "2026", "5", "3", "1,200", "45,800", "カフェ"),
+    ])
+    import_resona_bank_csv(second, str(db))
+
+    c = sqlite3.connect(db)
+    try:
+        assert c.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 3
+        assert c.execute("SELECT COUNT(*) FROM transactions WHERE fitid_policy='v2'").fetchone()[0] == 3
+    finally:
+        c.close()
+
+
+def test_import_keeps_legitimate_same_day_same_amount_rows(tmp_path):
+    """同日・同額・同摘要の正当な 2 件は残高と連番で分かれる(過少計上を防ぐ)。"""
+    db = _make_db(tmp_path)
+    csvp = tmp_path / "r.csv"
+    _write_csv(csvp, [
+        _row("明細", "支払", "2026", "5", "2", "450", "9,550", "振替　ＳＢＩ証券"),
+        _row("明細", "支払", "2026", "5", "2", "450", "9,100", "振替　ＳＢＩ証券"),
+    ])
+    import_resona_bank_csv(csvp, str(db))
+
+    c = sqlite3.connect(db)
+    try:
+        assert c.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 2
+    finally:
+        c.close()

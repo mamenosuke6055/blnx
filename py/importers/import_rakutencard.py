@@ -7,6 +7,9 @@ import hashlib
 import re
 import unicodedata
 import uuid
+from collections import Counter
+
+from py.importers import ledger
 
 def get_project_root() -> Path:
     """プロジェクトのルートディレクトリを取得します。"""
@@ -170,24 +173,21 @@ def import_rakuten_card_csv(csv_path: Path, db_path: str = None):
     df['amount'] = pd.to_numeric(df['amount'].astype(str).str.replace(',', ''), errors='coerce').fillna(0).astype(int)
     df = df[['date', 'amount', 'description']]
 
-    def generate_fitid(row):
+    def legacy_fitid(row):
+        # v1(旧実装の式)。既存行との突合にのみ使う
         return 'SHA256:' + hashlib.sha256(
             f"RAKUTENCARD:{row['date']}:{row['amount']}:{row['description']}".encode()
         ).hexdigest()
-    df['ofx_fitid'] = df.apply(generate_fitid, axis=1)
+    df['_legacy_fitid'] = df.apply(legacy_fitid, axis=1)
     df['_dedup_key'] = df.apply(
         lambda r: card_dedup_key(r['date'], r['amount'], r['description']), axis=1
     )
-
-    # 完全一致(fitid)と正規化キー(2フォーマット二重取込対策)の両方でファイル内重複排除
-    df.drop_duplicates(subset=['ofx_fitid'], keep='first', inplace=True)
-    df.drop_duplicates(subset=['_dedup_key'], keep='first', inplace=True)
 
     conn = None
     try:
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
-        
+
         # --- 勘定科目と通貨のGUIDを取得 ---
         liability_account_guid = get_or_create_account_guid(conn, ['Liabilities', 'Credit Card', 'Rakuten Card'], 'LIABILITY')
         expense_account_guid = get_or_create_account_guid(conn, ['Expenses', 'Uncategorized'], 'EXPENSE')
@@ -196,13 +196,10 @@ def import_rakuten_card_csv(csv_path: Path, db_path: str = None):
         # 勘定科目作成のトランザクションをコミット
         conn.commit()
 
-        # --- 既存のFITIDを取得（完全一致用） ---
-        cursor.execute("SELECT ofx_fitid FROM transactions WHERE ofx_fitid IS NOT NULL")
-        existing_ids = {row[0] for row in cursor.fetchall()}
-
-        # --- 既存の楽天カード取引を正規化キーで取得（2フォーマット二重取込対策） ---
-        # description 違いで fitid をすり抜ける同一決済を (日付, 金額, 正規化マーチャント)
-        # で検出し二重計上を防ぐ。
+        # --- 既存の楽天カード取引を正規化キーで数える（2フォーマット二重取込対策） ---
+        # description 違いで鍵をすり抜ける同一決済を (日付, 金額, 正規化マーチャント) で
+        # 検出する。件数で持つのは、同日・同額・同店の**正当な 2 件**を潰さないため
+        # (旧実装は 1 件に畳んでいた = 過少計上。Doc_Import_Identity_Simulation 結果 4)。
         cursor.execute(
             """
             SELECT t.post_date, CAST(-s.value_num*1.0/s.value_denom AS INTEGER), t.description
@@ -211,49 +208,43 @@ def import_rakuten_card_csv(csv_path: Path, db_path: str = None):
             """,
             (liability_account_guid,),
         )
-        existing_keys = {card_dedup_key(d, amt, desc) for d, amt, desc in cursor.fetchall()}
+        existing_counts = Counter(card_dedup_key(d, amt, desc) for d, amt, desc in cursor.fetchall())
 
+        seen_in_file = Counter()
+        seq = ledger.SeqCounter()
         new_transactions = 0
         for _, row in df.iterrows():
-            if row['ofx_fitid'] in existing_ids or row['_dedup_key'] in existing_keys:
+            amount = int(row['amount'])
+            dedup_key = row['_dedup_key']
+            seen_in_file[dedup_key] += 1
+            # この鍵は DB に既に n 件ある → ファイル内 n 本目までは取込済みとみなす
+            if seen_in_file[dedup_key] <= existing_counts[dedup_key]:
                 continue
 
-            conn.execute("BEGIN;")
+            posting = ledger.Posting(
+                source="rakuten_card",
+                account_key="rakuten_card",
+                date=row['date'],
+                description=row['description'],
+                amount=amount,
+                balance=None,      # カード明細に残高欄はない(連番で分ける)
+                seq=seq.next(row['date'], row['description'], amount),
+                # 費用(借方) / 負債の増加(貸方)
+                entries=(
+                    ledger.Entry(expense_account_guid, amount,
+                                 quantity_num=amount, quantity_denom=1),
+                    ledger.Entry(liability_account_guid, -amount,
+                                 quantity_num=-amount, quantity_denom=1),
+                ),
+                currency_guid=jpy_guid,
+                legacy_fitids=(row['_legacy_fitid'],),
+            )
             try:
-                tx_guid = uuid.uuid4().hex
-                post_date = row['date']
-                amount = int(row['amount'])
-
-                # 1. transactions テーブルに登録
-                cursor.execute("""
-                    INSERT INTO transactions (guid, post_date, description, ofx_fitid, currency_guid)
-                    VALUES (?, ?, ?, ?, ?)
-                """, (tx_guid, post_date, row['description'], row['ofx_fitid'], jpy_guid))
-                
-                # 2. splits テーブルに登録 (仕訳)
-                # 費用(未分類)の増加 / 負債(楽天カード)の増加
-                split1_guid = uuid.uuid4().hex
-                split2_guid = uuid.uuid4().hex
-                
-                # 費用 (借方 Debit)
-                cursor.execute("""
-                    INSERT INTO splits (guid, tx_guid, account_guid, value_num, value_denom, quantity_num, quantity_denom)
-                    VALUES (?, ?, ?, ?, 1, ?, 1)
-                """, (split1_guid, tx_guid, expense_account_guid, amount, amount))
-
-                # 負債 (貸方 Credit)
-                cursor.execute("""
-                    INSERT INTO splits (guid, tx_guid, account_guid, value_num, value_denom, quantity_num, quantity_denom)
-                    VALUES (?, ?, ?, ?, 1, ?, 1)
-                """, (split2_guid, tx_guid, liability_account_guid, -amount, -amount))
-
-                conn.commit()
-                existing_ids.add(row['ofx_fitid'])
-                existing_keys.add(row['_dedup_key'])
-                new_transactions += 1
-            except sqlite3.Error as e:
-                conn.rollback()
-                print(f"エラー: DB登録中にエラーが発生しました。スキップします。詳細: {e}")
+                if ledger.post(conn, posting) is not None:
+                    new_transactions += 1
+            except ValueError as e:
+                print(f"取込拒否(形が合わない): {e}")
+        conn.commit()
 
         if new_transactions > 0:
             print(f"{new_transactions}件の新しい取引データを '{db_path}' にインポートしました。({csv_path.name})")

@@ -6,6 +6,7 @@ import hashlib
 import uuid
 import glob
 
+from py.importers import ledger
 from py.processing.classify_bank_income import classify_income
 
 # 口座振替でカード負債を返済するパターン。費用ではなく負債の減少として仕訳する。
@@ -123,28 +124,32 @@ def import_rakuten_bank_csv(csv_path: Path, db_path: str = None):
     # 金額のカンマ除去と数値変換
     df['amount'] = df['amount'].astype(str).str.replace(',', '').astype(int)
     
-    df = df[['date', 'amount', 'description']]
+    # 残高欄があれば自然キーに使う(同日・同額・同摘要の正当な 2 件を分けるため)
+    balance_col = next((c for c in df.columns if '残高' in str(c)), None)
+    if balance_col:
+        df['balance'] = (df[balance_col].astype(str).str.replace(',', '')
+                         .str.extract(r'(-?\d+)', expand=False).astype('Int64'))
+    else:
+        df['balance'] = None
+
+    df = df[['date', 'amount', 'description', 'balance']]
 
     df['description'] = df['description'].str.strip()
 
-    def generate_fitid(row):
+    def legacy_fitid(row):
+        # v1(旧実装の式。残高を含まないため同日同額同摘要が潰れた)。既存行との突合にのみ使う
         return 'SHA256:' + hashlib.sha256(
             f"RAKUTENBANK:{row['date']}:{row['amount']}:{row['description']}".encode()
         ).hexdigest()
-    df['ofx_fitid'] = df.apply(generate_fitid, axis=1)
-
-    # --- ファイル内の重複を除外 ---
-    df.drop_duplicates(subset=['ofx_fitid'], keep='first', inplace=True)
 
     conn = None
     try:
         conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-        
+
         # --- 勘定科目の取得/作成 ---
         # 資産: 楽天銀行
         bank_account_guid = get_or_create_account_guid(conn, ['Assets', 'Bank', 'Rakuten Bank'], 'ASSET')
-        
+
         # 相手方勘定（デフォルト）
         # 収入: Income:Uncategorized
         income_account_guid = get_or_create_account_guid(conn, ['Income', 'Uncategorized'], 'INCOME')
@@ -158,83 +163,58 @@ def import_rakuten_bank_csv(csv_path: Path, db_path: str = None):
 
         conn.commit()
 
-        # --- 既存のFITIDを取得 ---
-        cursor.execute("SELECT ofx_fitid FROM transactions WHERE ofx_fitid IS NOT NULL")
-        existing_ids = {row[0] for row in cursor.fetchall()}
-
+        seq = ledger.SeqCounter()
         new_transactions = 0
         for _, row in df.iterrows():
-            if row['ofx_fitid'] in existing_ids:
-                continue
+            amount = int(row['amount'])
+            description = row['description']
 
-            cursor.execute("BEGIN;")
+            if amount > 0:   # 入金
+                # 入金の相手勘定を分類: 自己資金移動(→Assets:Transfer)・給与・利息は
+                # 適切な勘定へ。未知の摘要は Income:Uncategorized に保留（人間レビュー用）。
+                klass = classify_income(description)
+                if klass is not None:
+                    peer_guid = get_or_create_account_guid(
+                        conn, list(klass.account_path), klass.account_type
+                    )
+                else:
+                    peer_guid = income_account_guid
+                entries = (
+                    ledger.Entry(bank_account_guid, amount, quantity_num=amount, quantity_denom=1),
+                    ledger.Entry(peer_guid, -amount, quantity_num=-amount, quantity_denom=1),
+                )
+            else:            # 出金
+                # カード引き落としなら負債口座へ、それ以外は費用へ
+                debit_account_guid = expense_account_guid
+                for keyword, liability_guid in card_payment_guids.items():
+                    if keyword in description:
+                        debit_account_guid = liability_guid
+                        break
+                abs_amount = abs(amount)
+                entries = (
+                    ledger.Entry(debit_account_guid, abs_amount,
+                                 quantity_num=abs_amount, quantity_denom=1),
+                    ledger.Entry(bank_account_guid, amount, quantity_num=amount, quantity_denom=1),
+                )
+
+            balance = None if row['balance'] is None or pd.isna(row['balance']) else int(row['balance'])
+            posting = ledger.Posting(
+                source="rakuten_bank",
+                account_key="main",
+                date=row['date'],
+                description=description,
+                amount=amount,
+                balance=balance,
+                seq=seq.next(row['date'], description, amount),
+                entries=entries,
+                legacy_fitids=(legacy_fitid(row),),
+            )
             try:
-                tx_guid = uuid.uuid4().hex
-                post_date = row['date']
-                amount = row['amount']
-                description = row['description']
-
-                # 1. transactions テーブルに登録
-                cursor.execute("""
-                    INSERT INTO transactions (guid, post_date, description, ofx_fitid)
-                    VALUES (?, ?, ?, ?)
-                """, (tx_guid, post_date, description, row['ofx_fitid']))
-                
-                # 2. splits テーブルに登録 (仕訳)
-                split1_guid = uuid.uuid4().hex
-                split2_guid = uuid.uuid4().hex
-                
-                if amount > 0: # 入金
-                    # 入金の相手勘定を分類: 自己資金移動(→Assets:Transfer)・給与・利息は
-                    # 適切な勘定へ。未知の摘要は Income:Uncategorized に保留（人間レビュー用）。
-                    klass = classify_income(description)
-                    if klass is not None:
-                        peer_guid = get_or_create_account_guid(
-                            conn, list(klass.account_path), klass.account_type
-                        )
-                    else:
-                        peer_guid = income_account_guid
-                    # 借方(Debit): 銀行 (資産増) +amount
-                    # 貸方(Credit): 相手勘定 -amount
-                    
-                    # Split 1: Bank (Debit)
-                    cursor.execute("""
-                        INSERT INTO splits (guid, tx_guid, account_guid, value_num, value_denom, quantity_num, quantity_denom)
-                        VALUES (?, ?, ?, ?, 1, ?, 1)
-                    """, (split1_guid, tx_guid, bank_account_guid, amount, amount))
-
-                    # Split 2: Income (Credit)
-                    cursor.execute("""
-                        INSERT INTO splits (guid, tx_guid, account_guid, value_num, value_denom, quantity_num, quantity_denom)
-                        VALUES (?, ?, ?, ?, 1, ?, 1)
-                    """, (split2_guid, tx_guid, peer_guid, -amount, -amount))
-
-                else: # 出金 (amount < 0)
-                    abs_amount = abs(amount)
-                    # カード引き落としなら負債口座へ、それ以外は費用へ
-                    debit_account_guid = expense_account_guid
-                    for keyword, liability_guid in card_payment_guids.items():
-                        if keyword in description:
-                            debit_account_guid = liability_guid
-                            break
-
-                    # Split 1: Expense or Liability (Debit) -> Positive value
-                    cursor.execute("""
-                        INSERT INTO splits (guid, tx_guid, account_guid, value_num, value_denom, quantity_num, quantity_denom)
-                        VALUES (?, ?, ?, ?, 1, ?, 1)
-                    """, (split1_guid, tx_guid, debit_account_guid, abs_amount, abs_amount))
-
-                    # Split 2: Bank (Credit) -> Negative value
-                    cursor.execute("""
-                        INSERT INTO splits (guid, tx_guid, account_guid, value_num, value_denom, quantity_num, quantity_denom)
-                        VALUES (?, ?, ?, ?, 1, ?, 1)
-                    """, (split2_guid, tx_guid, bank_account_guid, amount, amount)) # amount is negative
-
-                cursor.execute("COMMIT;")
-                new_transactions += 1
-            except sqlite3.Error as e:
-                cursor.execute("ROLLBACK;")
-                print(f"エラー: DB登録中にエラーが発生しました。スキップします。詳細: {e}")
+                if ledger.post(conn, posting) is not None:
+                    new_transactions += 1
+            except ValueError as e:
+                print(f"取込拒否(形が合わない): {e}")
+        conn.commit()
 
         if new_transactions > 0:
             print(f"{new_transactions}件の新しい取引データを '{db_path}' にインポートしました。({csv_path.name})")

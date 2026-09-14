@@ -8,11 +8,13 @@ import uuid
 from datetime import datetime
 import re
 
+from py.importers import ledger
 from py.importers._cost_basis import (
     calc_moving_avg_cost_per_unit,
     get_capital_gain_account_guid,
     get_capital_loss_account_guid,
     build_sell_splits,
+    sell_entries,
 )
 
 def get_project_root() -> Path:
@@ -310,6 +312,7 @@ def import_rakuten_adjhistory_jp(csv_path: Path):
     conn.commit()
 
     count = 0
+    seq = ledger.SeqCounter()
     for _, row in df.iterrows():
         tx_type = str(row['取引区分']).strip()
 
@@ -345,31 +348,21 @@ def import_rakuten_adjhistory_jp(csv_path: Path):
         sec_name = str(row['対象証券名']).strip()
         desc = tx_type if sec_name == '-' else f"{tx_type} {sec_name}"
 
-        fitid = 'SHA256:' + hashlib.sha256(
+        legacy = 'SHA256:' + hashlib.sha256(
             f"RAKUTEN_ADJ:{trade_date}:{tx_type}:{amount}".encode()
         ).hexdigest()
 
-        cursor.execute("SELECT 1 FROM transactions WHERE ofx_fitid = ?", (fitid,))
-        if cursor.fetchone():
-            continue
-
-        tx_guid = uuid.uuid4().hex
-        cursor.execute("""
-            INSERT INTO transactions (guid, post_date, description, ofx_fitid, currency_guid)
-            VALUES (?, ?, ?, ?, ?)
-        """, (tx_guid, trade_date, desc, fitid, jpy_guid))
-
-        cursor.execute("""
-            INSERT INTO splits (guid, tx_guid, account_guid, value_num, value_denom, quantity_num, quantity_denom)
-            VALUES (?, ?, ?, ?, 1, ?, 1)
-        """, (uuid.uuid4().hex, tx_guid, rakuten_sec_acct, int(amount), int(amount)))
-
-        cursor.execute("""
-            INSERT INTO splits (guid, tx_guid, account_guid, value_num, value_denom, quantity_num, quantity_denom)
-            VALUES (?, ?, ?, ?, 1, ?, 1)
-        """, (uuid.uuid4().hex, tx_guid, peer, int(-amount), int(-amount)))
-
-        count += 1
+        posted = ledger.post(conn, ledger.Posting(
+            source="rakuten_sec", account_key="cash_jpy",
+            date=trade_date, description=desc, amount=amount,
+            seq=seq.next(trade_date, desc, amount),
+            entries=(
+                ledger.Entry(rakuten_sec_acct, int(amount), 1, int(amount), 1),
+                ledger.Entry(peer, int(-amount), 1, int(-amount), 1),
+            ),
+            currency_guid=jpy_guid, legacy_fitids=(legacy,)))
+        if posted is not None:
+            count += 1
 
     conn.commit()
     conn.close()
@@ -421,6 +414,7 @@ def import_rakuten_withdrawal_list(csv_path: Path):
     conn.commit()
     
     count = 0
+    seq = ledger.SeqCounter()
     for _, row in df.iterrows():
         date = parse_rakuten_date(row['入出金日'])
         if not date: continue
@@ -455,31 +449,21 @@ def import_rakuten_withdrawal_list(csv_path: Path):
         else:
             continue
 
-        raw_str = f"RAKUTEN_DW:{date}:{desc}:{amount}"
-        fitid = 'SHA256:' + hashlib.sha256(raw_str.encode()).hexdigest()
-        
-        cursor.execute("SELECT 1 FROM transactions WHERE ofx_fitid = ?", (fitid,))
-        if cursor.fetchone(): continue
-        
-        tx_guid = uuid.uuid4().hex
-        cursor.execute("""
-            INSERT INTO transactions (guid, post_date, description, ofx_fitid, currency_guid)
-            VALUES (?, ?, ?, ?, ?)
-        """, (tx_guid, date, desc, fitid, jpy_guid))
-        
-        # Split 1: Rakuten Sec Cash (Main)
-        cursor.execute("""
-            INSERT INTO splits (guid, tx_guid, account_guid, value_num, value_denom, quantity_num, quantity_denom)
-            VALUES (?, ?, ?, ?, 1, ?, 1)
-        """, (uuid.uuid4().hex, tx_guid, rakuten_sec_acct, int(amount), int(amount)))
-        
-        # Split 2: Peer
-        cursor.execute("""
-            INSERT INTO splits (guid, tx_guid, account_guid, value_num, value_denom, quantity_num, quantity_denom)
-            VALUES (?, ?, ?, ?, 1, ?, 1)
-        """, (uuid.uuid4().hex, tx_guid, peer_account, int(-amount), int(-amount)))
-        
-        count += 1
+        legacy = 'SHA256:' + hashlib.sha256(
+            f"RAKUTEN_DW:{date}:{desc}:{amount}".encode()).hexdigest()
+
+        posted = ledger.post(conn, ledger.Posting(
+            source="rakuten_sec", account_key="cash_jpy",
+            date=date, description=desc, amount=amount,
+            seq=seq.next(date, desc, amount),
+            entries=(
+                # Split 1: Rakuten Sec Cash (Main) / Split 2: Peer
+                ledger.Entry(rakuten_sec_acct, int(amount), 1, int(amount), 1),
+                ledger.Entry(peer_account, int(-amount), 1, int(-amount), 1),
+            ),
+            currency_guid=jpy_guid, legacy_fitids=(legacy,)))
+        if posted is not None:
+            count += 1
         
     conn.commit()
     conn.close()
@@ -501,6 +485,7 @@ def import_rakuten_trade_invst(csv_path: Path):
     income_div_acct = get_or_create_account_guid(conn, ['Income', 'Dividend'], 'INCOME')
     
     count = 0
+    seq = ledger.SeqCounter()
     for _, row in df.iterrows():
         date = parse_rakuten_date(row['約定日'])
         settle_date = parse_rakuten_date(row['受渡日'])
@@ -520,79 +505,58 @@ def import_rakuten_trade_invst(csv_path: Path):
             conn, ['Assets', 'Investments', 'Rakuten Securities', fund_name], 'ASSET', 'INVESTMENT'
         )
         
-        fitid = 'SHA256:' + hashlib.sha256(f"RAKUTEN_INVST:{date}:{fund_name}:{tx_type_raw}:{units}:{total_amount}".encode()).hexdigest()
-        
-        cursor.execute("SELECT 1 FROM transactions WHERE ofx_fitid = ?", (fitid,))
-        if cursor.fetchone(): continue
-        
-        tx_guid = uuid.uuid4().hex
+        legacy = 'SHA256:' + hashlib.sha256(
+            f"RAKUTEN_INVST:{date}:{fund_name}:{tx_type_raw}:{units}:{total_amount}".encode()
+        ).hexdigest()
+
         desc = f"{tx_type_raw} {fund_name}"
-        
-        cursor.execute("""
-            INSERT INTO transactions (guid, post_date, description, ofx_fitid, currency_guid)
-            VALUES (?, ?, ?, ?, ?)
-        """, (tx_guid, date, desc, fitid, currency_guid))
-        
         inv_type = 'BUY'
-        
+
         if tx_type_raw == '買付':
             inv_type = 'BUY'
-            # Debit Asset (Increase)
-            cursor.execute("""
-                INSERT INTO splits (guid, tx_guid, account_guid, value_num, value_denom, quantity_num, quantity_denom)
-                VALUES (?, ?, ?, ?, 1, ?, 10000)
-            """, (uuid.uuid4().hex, tx_guid, sec_account, int(total_amount), int(units * 10000))) # Assuming units is 1/10000 scale? Fund usually 1 unit = 1 yen usually 10000 units price? 
-            # Actually Rakuten CSV "単価" is usually for 10,000 units. 
-            # Quantity in CSV is "口". 
-            # Price convention: If price is per 10000 units, and you bought X units.
-            # We store quantity as X.
-            
-            # Credit Cash (Decrease)
-            cursor.execute("""
-                INSERT INTO splits (guid, tx_guid, account_guid, value_num, value_denom, quantity_num, quantity_denom)
-                VALUES (?, ?, ?, ?, 1, ?, 1)
-            """, (uuid.uuid4().hex, tx_guid, rakuten_sec_bank, int(-total_amount), int(-total_amount)))
-            
-        elif tx_type_raw == '解約': # Sell — H1 修正: 3-way (Cash + Asset@cost + P/L)
+            # 借方: ファンド(口数は 1/10000 単位) / 貸方: 証券口座の現金
+            entries = (
+                ledger.Entry(sec_account, int(total_amount), 1, int(units * 10000), 10000),
+                ledger.Entry(rakuten_sec_bank, int(-total_amount), 1, int(-total_amount), 1),
+            )
+        elif tx_type_raw == '解約':   # Sell — 3-way (Cash + Asset@cost + P/L)
             inv_type = 'SELL'
             cost_per_unit, _ = calc_moving_avg_cost_per_unit(conn, sec_account, date)
-            cap_gain = get_capital_gain_account_guid(conn)
-            cap_loss = get_capital_loss_account_guid(conn)
-            build_sell_splits(
-                cursor, tx_guid,
+            entries = sell_entries(
                 cash_account_guid=rakuten_sec_bank,
                 security_account_guid=sec_account,
-                capital_gain_account_guid=cap_gain,
-                capital_loss_account_guid=cap_loss,
+                capital_gain_account_guid=get_capital_gain_account_guid(conn),
+                capital_loss_account_guid=get_capital_loss_account_guid(conn),
                 proceeds=total_amount,
                 units=units,
                 cost_per_unit=cost_per_unit,
                 value_denom=1,
                 asset_qty_denom=10000,
             )
-
         elif tx_type_raw == '再投資':
             inv_type = 'REINVEST'
-             # Debit Asset (Increase)
-            cursor.execute("""
-                INSERT INTO splits (guid, tx_guid, account_guid, value_num, value_denom, quantity_num, quantity_denom)
-                VALUES (?, ?, ?, ?, 1, ?, 10000)
-            """, (uuid.uuid4().hex, tx_guid, sec_account, int(total_amount), int(units * 10000)))
-            
-            # Credit Income (Increase)
-            cursor.execute("""
-                INSERT INTO splits (guid, tx_guid, account_guid, value_num, value_denom, quantity_num, quantity_denom)
-                VALUES (?, ?, ?, ?, 1, ?, 1)
-            """, (uuid.uuid4().hex, tx_guid, income_div_acct, int(-total_amount), int(-total_amount)))
+            # 借方: ファンド / 貸方: 分配金収益。現金は動かない
+            # (旧実装は現金を貸方に立て、口数の分母も落としていた。fd 012b5bf2f683)
+            entries = (
+                ledger.Entry(sec_account, int(total_amount), 1, int(units * 10000), 10000),
+                ledger.Entry(income_div_acct, int(-total_amount), 1, int(-total_amount), 1),
+            )
+        else:
+            print(f"  Unknown trade type skipped: {tx_type_raw}")
+            continue
 
-        # Inv Tx Table
-        cursor.execute("""
-            INSERT INTO investment_transactions (guid, tx_guid, security_guid, type, units, unit_price, total_amount, currency_guid, trade_date, settle_date)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (uuid.uuid4().hex, tx_guid, sec_account, inv_type, units, unit_price, total_amount, currency_guid, date, settle_date))
-        
-        count += 1
-        
+        posted = ledger.post(conn, ledger.Posting(
+            source="rakuten_sec", account_key="toushin",
+            date=date, description=desc, amount=total_amount,
+            seq=seq.next(date, desc, total_amount),
+            entries=entries, currency_guid=currency_guid,
+            investment={"security_guid": sec_account, "type": inv_type, "units": units,
+                        "unit_price": unit_price, "total_amount": total_amount,
+                        "trade_date": date, "settle_date": settle_date},
+            legacy_fitids=(legacy,)))
+        if posted is not None:
+            count += 1
+
     conn.commit()
     conn.close()
     print(f"Imported {count} investment trades.")
@@ -610,6 +574,7 @@ def import_rakuten_trade_jp(csv_path: Path):
     rakuten_sec_bank = get_or_create_account_guid(conn, ['Assets', 'Bank', 'Rakuten Securities'], 'ASSET', 'BANK')
     
     count = 0
+    seq = ledger.SeqCounter()
     for _, row in df.iterrows():
         date = parse_rakuten_date(row['約定日'])
         settle_date = parse_rakuten_date(row['受渡日'])
@@ -628,59 +593,48 @@ def import_rakuten_trade_jp(csv_path: Path):
             conn, ['Assets', 'Investments', 'Rakuten Securities', name], 'ASSET', 'INVESTMENT', code=code
         )
         
-        fitid = 'SHA256:' + hashlib.sha256(f"RAKUTEN_JP:{date}:{code}:{tx_type_raw}:{units}:{total_amount}".encode()).hexdigest()
-        
-        cursor.execute("SELECT 1 FROM transactions WHERE ofx_fitid = ?", (fitid,))
-        if cursor.fetchone(): continue
-        
-        tx_guid = uuid.uuid4().hex
+        legacy = 'SHA256:' + hashlib.sha256(
+            f"RAKUTEN_JP:{date}:{code}:{tx_type_raw}:{units}:{total_amount}".encode()
+        ).hexdigest()
+
         desc = f"{tx_type_raw} {name}"
-        
-        cursor.execute("""
-            INSERT INTO transactions (guid, post_date, description, ofx_fitid, currency_guid)
-            VALUES (?, ?, ?, ?, ?)
-        """, (tx_guid, date, desc, fitid, currency_guid))
-        
         inv_type = 'BUY'
-        
+
         if tx_type_raw == '買付':
             inv_type = 'BUY'
-            # Debit Asset
-            cursor.execute("""
-                INSERT INTO splits (guid, tx_guid, account_guid, value_num, value_denom, quantity_num, quantity_denom)
-                VALUES (?, ?, ?, ?, 1, ?, 1)
-            """, (uuid.uuid4().hex, tx_guid, sec_account, int(total_amount), int(units)))
-            
-            # Credit Cash
-            cursor.execute("""
-                INSERT INTO splits (guid, tx_guid, account_guid, value_num, value_denom, quantity_num, quantity_denom)
-                VALUES (?, ?, ?, ?, 1, ?, 1)
-            """, (uuid.uuid4().hex, tx_guid, rakuten_sec_bank, int(-total_amount), int(-total_amount)))
-            
-        elif tx_type_raw == '売付':  # H1 修正: 3-way (Cash + Asset@cost + P/L)
+            entries = (
+                ledger.Entry(sec_account, int(total_amount), 1, int(units), 1),
+                ledger.Entry(rakuten_sec_bank, int(-total_amount), 1, int(-total_amount), 1),
+            )
+        elif tx_type_raw == '売付':   # 3-way (Cash + Asset@cost + P/L)
             inv_type = 'SELL'
             cost_per_unit, _ = calc_moving_avg_cost_per_unit(conn, sec_account, date)
-            cap_gain = get_capital_gain_account_guid(conn)
-            cap_loss = get_capital_loss_account_guid(conn)
-            build_sell_splits(
-                cursor, tx_guid,
+            entries = sell_entries(
                 cash_account_guid=rakuten_sec_bank,
                 security_account_guid=sec_account,
-                capital_gain_account_guid=cap_gain,
-                capital_loss_account_guid=cap_loss,
+                capital_gain_account_guid=get_capital_gain_account_guid(conn),
+                capital_loss_account_guid=get_capital_loss_account_guid(conn),
                 proceeds=total_amount,
                 units=units,
                 cost_per_unit=cost_per_unit,
                 value_denom=1,
                 asset_qty_denom=1,
             )
+        else:
+            print(f"  Unknown trade type skipped: {tx_type_raw}")
+            continue
 
-        cursor.execute("""
-            INSERT INTO investment_transactions (guid, tx_guid, security_guid, type, units, unit_price, total_amount, currency_guid, trade_date, settle_date)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (uuid.uuid4().hex, tx_guid, sec_account, inv_type, units, unit_price, total_amount, currency_guid, date, settle_date))
-        
-        count += 1
+        posted = ledger.post(conn, ledger.Posting(
+            source="rakuten_sec", account_key="kabushiki_jp",
+            date=date, description=desc, amount=total_amount,
+            seq=seq.next(date, desc, total_amount),
+            entries=entries, currency_guid=currency_guid,
+            investment={"security_guid": sec_account, "type": inv_type, "units": units,
+                        "unit_price": unit_price, "total_amount": total_amount,
+                        "trade_date": date, "settle_date": settle_date},
+            legacy_fitids=(legacy,)))
+        if posted is not None:
+            count += 1
 
     conn.commit()
     conn.close()
