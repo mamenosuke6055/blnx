@@ -16,8 +16,9 @@ def _add_account(conn: sqlite3.Connection, guid: str, name: str,
 def _add_tx(conn: sqlite3.Connection, tx_guid: str, post_date: str, enter_date: str,
             account_guid: str, value_num: int) -> None:
     conn.execute(
-        "INSERT INTO transactions (guid, post_date, enter_date, description) VALUES (?, ?, ?, ?)",
-        (tx_guid, post_date, enter_date, "test"),
+        "INSERT INTO transactions (guid, post_date, enter_date, description, ofx_fitid)"
+        " VALUES (?, ?, ?, ?, ?)",
+        (tx_guid, post_date, enter_date, "test", f"TEST:{tx_guid}"),
     )
     conn.execute(
         "INSERT INTO splits (guid, tx_guid, account_guid, value_num, value_denom) VALUES (?, ?, ?, ?, 1)",

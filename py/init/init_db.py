@@ -86,11 +86,20 @@ def create_finance_tables(conn: sqlite3.Connection) -> None:
         enter_date TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         description TEXT,
         num TEXT, -- 小切手番号など
-        ofx_fitid TEXT UNIQUE, -- OFXエクスポート用の一意なID
+        -- 同一性(fossil の uuid 相当)。NULL は UNIQUE も等値比較もすり抜け、
+        -- 再取込で二重計上になるため必ず入れる(技術ノート 289c50d8ac 症状(2))
+        ofx_fitid TEXT NOT NULL UNIQUE,
+        -- 鍵の規則版(fossil の hash policy 相当)。v1 = importer ごとの旧規則(書き換えない)、
+        -- v2 = 記帳サービスの単一規則 K=(source,口座,日付,摘要,金額,残高,ファイル内連番)
+        fitid_policy TEXT NOT NULL DEFAULT 'v1',
+        natural_key TEXT UNIQUE, -- v2 の K を正規化した文字列(v1 行は NULL)
         currency_guid TEXT, -- 通貨のGUID (将来的な拡張用)
         manual_category_guid TEXT, -- ユーザーが手動で設定したカテゴリ (accounts.guid)
         ai_category_guid TEXT, -- AIが予測したカテゴリ (accounts.guid)
         ai_confirmed_at TEXT, -- AI予測の確定日時 (NULL=未確定バッファ、NOT NULL=splits反映済み)
+        CHECK (ofx_fitid <> ''),
+        CHECK (fitid_policy IN ('v1', 'v2')),
+        CHECK (fitid_policy <> 'v2' OR natural_key IS NOT NULL),
         FOREIGN KEY (currency_guid) REFERENCES currencies(guid),
         FOREIGN KEY (manual_category_guid) REFERENCES accounts(guid),
         FOREIGN KEY (ai_category_guid) REFERENCES accounts(guid)

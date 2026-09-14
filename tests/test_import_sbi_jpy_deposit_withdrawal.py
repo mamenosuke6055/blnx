@@ -194,8 +194,9 @@ def _setup_clearing_scenario(db_path: Path, monkeypatch) -> None:
     def _tx(date, splits, desc=""):
         tg = _guid()
         conn.execute(
-            "INSERT INTO transactions (guid, post_date, description) VALUES (?,?,?)",
-            (tg, date, desc),
+            "INSERT INTO transactions (guid, post_date, description, ofx_fitid)"
+            " VALUES (?,?,?,?)",
+            (tg, date, desc, f"TEST:{tg}"),
         )
         for acc, val in splits:
             conn.execute(

@@ -25,8 +25,9 @@ def _add_account(conn, name, account_type, placeholder=0):
 def _add_tx(conn, post_date, splits, description=''):
     tx_guid = uuid.uuid4().hex
     conn.execute(
-        "INSERT INTO transactions (guid, post_date, description) VALUES (?, ?, ?)",
-        (tx_guid, post_date, description),
+        "INSERT INTO transactions (guid, post_date, description, ofx_fitid)"
+        " VALUES (?, ?, ?, ?)",
+        (tx_guid, post_date, description, f"TEST:{tx_guid}"),
     )
     for acc, num, denom in splits:
         conn.execute(

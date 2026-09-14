@@ -36,8 +36,10 @@ def _stub_import_adding(n_tx):
         conn = sqlite3.connect(db_path)
         for i in range(n_tx):
             conn.execute(
-                "INSERT INTO transactions (guid, post_date, description) VALUES (?, ?, ?)",
-                (f"{csv_file.name}-{i}-{source}", "2026-06-01", "stub"),
+                "INSERT INTO transactions (guid, post_date, description, ofx_fitid)"
+                " VALUES (?, ?, ?, ?)",
+                (f"{csv_file.name}-{i}-{source}", "2026-06-01", "stub",
+                 f"TEST:{csv_file.name}-{i}-{source}"),
             )
         conn.commit()
         conn.close()

@@ -29,9 +29,10 @@ def _add_account(conn, guid, name, account_type, parent_guid=None):
 
 def _add_manual_tx(conn, guid, description, manual_category_guid, post_date="2026-05-01"):
     conn.execute(
-        "INSERT INTO transactions (guid, post_date, enter_date, description, manual_category_guid) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (guid, post_date, f"{post_date} 00:00:00", description, manual_category_guid),
+        "INSERT INTO transactions (guid, post_date, enter_date, description,"
+        " manual_category_guid, ofx_fitid) VALUES (?, ?, ?, ?, ?, ?)",
+        (guid, post_date, f"{post_date} 00:00:00", description, manual_category_guid,
+         f"TEST:{guid}"),
     )
 
 
