@@ -163,3 +163,55 @@ def test_zero_balance_accounts_excluded(conn):
     bs = compute_balance_sheet(conn, at=date(2026, 5, 15))
     assert bs['assets'] == []
     assert bs['equity_accounts'] == []
+
+
+# ── 支出カテゴリの誤りが BS へ漏れないこと(境界の契約) ─────────────────
+
+def _net_worth(conn, at):
+    bs = compute_balance_sheet(conn, at=at)
+    return bs['total_assets'] - bs['total_liabilities'], bs['balanced']
+
+
+def test_reclassifying_within_expense_leaves_net_worth_untouched(conn):
+    """食費 → 娯楽 のような付け替えは純資産を動かさない。
+
+    方針(2026-09-17): カテゴリ分類が失敗しても BS 関連と CF 関連に影響しなければよい。
+    支出カテゴリは QOL 側の道具(裁量枠の内訳)であって、BS の構成要素ではない。
+    純資産は資産と負債だけで決まるので、EXPENSE の葉をどう取り違えても動かない。
+    """
+    bank = _add_account(conn, "Bank", "ASSET")
+    eq = _add_account(conn, "Opening Balances", "EQUITY")
+    food = _add_account(conn, "食料品", "EXPENSE")
+    fun = _add_account(conn, "グッズ", "EXPENSE")
+    _add_tx(conn, '2026-06-01', [(bank, 200_000, 1), (eq, -200_000, 1)])
+    _add_tx(conn, '2026-06-05', [(food, 60_000, 1), (bank, -60_000, 1)])
+    conn.commit()
+    before = _net_worth(conn, date(2026, 6, 30))
+
+    conn.execute("UPDATE splits SET account_guid = ? WHERE account_guid = ?", (fun, food))
+    conn.commit()
+    assert _net_worth(conn, date(2026, 6, 30)) == before, "EXPENSE 内の付け替えが BS に漏れている"
+
+
+def test_crossing_expense_to_asset_does_move_net_worth(conn):
+    """EXPENSE ↔ ASSET を跨ぐ誤りは純資産を動かす(守る対象をここに限定する対照)。
+
+    2026-09-17 の実データがこれ。証券への日次積立が費用に計上されていて、
+    Assets:Transfer へ付け替えたら清算勘定の phantom -403,674 が消えた。
+    細かいカテゴリの取り違えとは効き方がまったく違う。
+    """
+    bank = _add_account(conn, "Bank", "ASSET")
+    eq = _add_account(conn, "Opening Balances", "EQUITY")
+    food = _add_account(conn, "食料品", "EXPENSE")
+    transfer = _add_account(conn, "Transfer", "ASSET")
+    _add_tx(conn, '2026-06-01', [(bank, 200_000, 1), (eq, -200_000, 1)])
+    _add_tx(conn, '2026-06-05', [(food, 60_000, 1), (bank, -60_000, 1)])
+    conn.commit()
+    nw_before, _ = _net_worth(conn, date(2026, 6, 30))
+    assert nw_before == 140_000
+
+    conn.execute("UPDATE splits SET account_guid = ? WHERE account_guid = ?", (transfer, food))
+    conn.commit()
+    nw_after, balanced = _net_worth(conn, date(2026, 6, 30))
+    assert nw_after == 200_000, "EXPENSE→ASSET は純資産に出る(出てよい)"
+    assert balanced
