@@ -155,3 +155,38 @@ def test_no_importer_writes_transactions_directly():
         if f.name != "ledger.py" and "INSERT INTO transactions" in f.read_text(encoding="utf-8")
     ]
     assert offenders == [], f"記帳サービスを通さず書いている importer: {offenders}"
+
+
+# --- 記帳先の口座(fd bccbd3b2ee56) ---------------------------------------
+
+def test_missing_account_is_rejected(db):
+    """存在しない口座への記帳は書かせない。
+
+    splits.account_guid には FOREIGN KEY が宣言されているが SQLite は
+    PRAGMA foreign_keys = ON を立てないと強制しない。実データで 1 件すり抜け、
+    BS が ¥10,325,196 合わなくなっていた。複式の合計は 0 で合うので
+    貸借一致の検算では捕まらない。
+    """
+    with pytest.raises(ValueError, match="存在しない口座"):
+        ledger.post(db, _posting(entries=(Entry("no_such_account", 100), Entry("a1", -100))))
+    assert _count(db) == 0, "拒否した記帳の transactions が残っている"
+
+
+def test_placeholder_account_is_rejected(db):
+    """placeholder(記帳できない親)への記帳も書かせない。
+
+    BS の集計は placeholder を除外するので、親に直接付いた split は静かに落ちる
+    (実データで ¥470)。
+    """
+    db.execute("INSERT INTO accounts (guid, name, account_type, placeholder)"
+               " VALUES ('p1','日用品','EXPENSE',1)")
+    with pytest.raises(ValueError, match="placeholder"):
+        ledger.post(db, _posting(entries=(Entry("p1", 100), Entry("a1", -100))))
+    assert _count(db) == 0
+
+
+def test_leaf_account_is_accepted(db):
+    """placeholder=0 の葉なら通る(上の 2 件が広すぎないことの裏返し)。"""
+    db.execute("INSERT INTO accounts (guid, name, account_type, placeholder)"
+               " VALUES ('p2','その他日用品','EXPENSE',0)")
+    assert ledger.post(db, _posting(entries=(Entry("p2", 100), Entry("a1", -100)))) is not None

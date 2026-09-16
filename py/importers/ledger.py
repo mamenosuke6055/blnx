@@ -146,12 +146,38 @@ def validate(p: Posting) -> None:
                 "(分母を落とした行は過去に二重計上を招いた)")
 
 
+def _validate_accounts(conn: sqlite3.Connection, p: Posting) -> None:
+    """記帳先の口座が実在し、かつ葉であることを確かめる。
+
+    splits.account_guid には FOREIGN KEY が宣言されているが、SQLite は
+    `PRAGMA foreign_keys = ON` を各接続で立てないと強制しない。実データで
+    存在しない口座を指す split が 1 件見つかり(楽天カード Opening Balance の
+    借方、¥10,324,726)、BS がその額だけ合わなくなっていた。複式の合計は 0 で
+    合うので貸借一致の検算をすり抜ける — ここで明示的に見る(fd bccbd3b2ee56)。
+
+    placeholder(記帳できない親)への記帳も同じ症状を起こす。BS の集計は
+    placeholder を除外するため、親に直接付いた split は静かに落ちる。
+    """
+    for e in p.entries:
+        row = conn.execute(
+            "SELECT COALESCE(placeholder, 0) FROM accounts WHERE guid = ?",
+            (e.account_guid,)).fetchone()
+        if row is None:
+            raise ValueError(
+                f"存在しない口座への記帳({e.account_guid}): {p.date} {p.description}")
+        if row[0]:
+            raise ValueError(
+                f"placeholder への記帳({e.account_guid}): {p.date} {p.description}"
+                "(親でなく葉の勘定を指すこと)")
+
+
 def post(conn: sqlite3.Connection, p: Posting) -> str | None:
     """記帳する。既に入っていれば何もせず None を返す(冪等)。
 
     呼び出し側は commit を管理する(1 ファイル = 1 トランザクションにできる)。
     """
     validate(p)
+    _validate_accounts(conn, p)
     key = natural_key(p)
     fitid = fitid_of(key)
 
