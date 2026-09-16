@@ -11,6 +11,7 @@ import uuid
 
 from py.importers import ledger
 from py.processing.classify_bank_income import classify_income
+from py.processing.classify_bank_outflow import classify_outflow
 
 # 口座振替でカード負債を返済するパターン。費用ではなく負債の減少として仕訳する。
 # (マッチキーワード, 負債口座パス)
@@ -268,12 +269,23 @@ def _import_dneobank_csv(csv_path, account_path, fitid_prefix, account_key, raw_
                 signed = amount
             else:
                 amount = withdrawal
-                # カード引き落としなら負債口座へ、それ以外は費用へ
-                debit_account_guid = expense_account_guid
+                # カード引き落としなら負債口座へ。次に自己資金移動(→Assets:Transfer)を
+                # 判定し、それ以外は費用へ。未知の摘要は Expenses:Uncategorized に
+                # 保留（人間レビュー用）。
+                debit_account_guid = None
                 for keyword, liability_guid in card_payment_guids.items():
                     if keyword in description:
                         debit_account_guid = liability_guid
                         break
+                if debit_account_guid is None:
+                    oklass = classify_outflow(description)
+                    debit_account_guid = (
+                        get_or_create_account_guid(
+                            conn, list(oklass.account_path), oklass.account_type
+                        )
+                        if oklass is not None
+                        else expense_account_guid
+                    )
                 # 借方: 費用増加 or 負債減少(+) / 貸方: 資産減少(-)
                 entries = (
                     ledger.Entry(debit_account_guid, amount, denom, amount, denom),

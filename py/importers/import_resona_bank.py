@@ -19,6 +19,7 @@ from pathlib import Path
 
 from py.importers import ledger
 from py.processing.classify_bank_income import classify_income
+from py.processing.classify_bank_outflow import classify_outflow
 
 # 全銀協系フォーマットの列インデックス
 COL_RECORD_TYPE = 0   # レコード区分（明細/合計）
@@ -170,9 +171,17 @@ def import_resona_bank_csv(csv_path, db_path: str = None):
                     ledger.Entry(bank_guid, amount, quantity_num=amount, quantity_denom=1),
                     ledger.Entry(peer_guid, -amount, quantity_num=-amount, quantity_denom=1),
                 )
-            else:  # 支払 — 借方: 費用(+) / 貸方: 銀行(資産減 -)
+            else:  # 支払 — 借方: 費用 or 自己資金移動(+) / 貸方: 銀行(資産減 -)
+                # 自己資金移動(→Assets:Transfer)を判定。未知の摘要は
+                # Expenses:Uncategorized に保留（人間レビュー用）。
+                oklass = classify_outflow(t["description"])
+                debit_guid = (
+                    get_or_create_account_guid(conn, list(oklass.account_path), oklass.account_type)
+                    if oklass is not None
+                    else expense_guid
+                )
                 entries = (
-                    ledger.Entry(expense_guid, amount, quantity_num=amount, quantity_denom=1),
+                    ledger.Entry(debit_guid, amount, quantity_num=amount, quantity_denom=1),
                     ledger.Entry(bank_guid, -amount, quantity_num=-amount, quantity_denom=1),
                 )
 

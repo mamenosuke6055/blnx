@@ -174,3 +174,56 @@ def test_same_day_same_amount_rows_are_distinct(dbs, tmp_path):
     n = c.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
     c.close()
     assert n == 2, "同額同摘要の 2 行が 1 件に潰れている"
+
+
+# ------------------------------------------------------ 出金側の分類(fd fc45d9de3b2a)
+
+def _peer_of(fin_db, description):
+    """description の取引で、銀行口座でない側の勘定パスを返す。"""
+    c = sqlite3.connect(fin_db)
+    rows = c.execute(
+        "SELECT a.name, p.name FROM splits s"
+        " JOIN transactions t ON t.guid = s.tx_guid"
+        " JOIN accounts a ON a.guid = s.account_guid"
+        " LEFT JOIN accounts p ON p.guid = a.parent_guid"
+        " WHERE t.description = ?", (description,)).fetchall()
+    c.close()
+    return {f"{parent}:{name}" for name, parent in rows}
+
+
+def test_outflow_self_move_goes_to_transfer(dbs, tmp_path):
+    """証券への振替は費用ではない。Expenses:Uncategorized に落とさない。
+
+    入金側だけが Assets:Transfer へ付け替えられていたため清算勘定が片肺になり、
+    実データで残差が -403,675 まで開いていた(fd fc45d9de3b2a / 4c39128ddc06)。
+    """
+    fin, raw = dbs
+    p = _csv(tmp_path / "out.csv", JPY_HEADER,
+             [("2026/06/03", "振替　ＳＢＩ証券", "435", "", "9,565")])
+    _archive(raw, p)
+    import_dneobank_csv(p, db_path=fin, raw_db_path=raw, account_key="dneobank_hybrid")
+    peers = _peer_of(fin, "振替　ＳＢＩ証券")
+    assert "Assets:Transfer" in peers
+    assert "Expenses:Uncategorized" not in peers
+
+
+def test_outflow_unknown_stays_uncategorized(dbs, tmp_path):
+    """判定できない出金は従来どおり費用に保留する(人間レビュー用)。"""
+    fin, raw = dbs
+    p = _csv(tmp_path / "out2.csv", JPY_HEADER,
+             [("2026/06/03", "口座振替　テストデンリヨク", "3,000", "", "7,000")])
+    _archive(raw, p)
+    import_dneobank_csv(p, db_path=fin, raw_db_path=raw, account_key="dneobank_hybrid")
+    assert "Expenses:Uncategorized" in _peer_of(fin, "口座振替　テストデンリヨク")
+
+
+def test_outflow_card_payment_still_wins(dbs, tmp_path):
+    """カード引落は負債の減少。自己振替判定より先に評価される。"""
+    fin, raw = dbs
+    p = _csv(tmp_path / "out3.csv", JPY_HEADER,
+             [("2026/06/27", "楽天カードサービス", "180,000", "", "20,000")])
+    _archive(raw, p)
+    import_dneobank_csv(p, db_path=fin, raw_db_path=raw, account_key="dneobank_main_jpy")
+    peers = _peer_of(fin, "楽天カードサービス")
+    assert any("Rakuten Card" in x for x in peers)
+    assert "Expenses:Uncategorized" not in peers

@@ -8,6 +8,7 @@ import glob
 
 from py.importers import ledger
 from py.processing.classify_bank_income import classify_income
+from py.processing.classify_bank_outflow import classify_outflow
 
 # 口座振替でカード負債を返済するパターン。費用ではなく負債の減少として仕訳する。
 # (マッチキーワード, 負債口座パス)
@@ -184,12 +185,23 @@ def import_rakuten_bank_csv(csv_path: Path, db_path: str = None):
                     ledger.Entry(peer_guid, -amount, quantity_num=-amount, quantity_denom=1),
                 )
             else:            # 出金
-                # カード引き落としなら負債口座へ、それ以外は費用へ
-                debit_account_guid = expense_account_guid
+                # カード引き落としなら負債口座へ。次に自己資金移動(→Assets:Transfer)を
+                # 判定し、それ以外は費用へ。未知の摘要は Expenses:Uncategorized に
+                # 保留（人間レビュー用）。
+                debit_account_guid = None
                 for keyword, liability_guid in card_payment_guids.items():
                     if keyword in description:
                         debit_account_guid = liability_guid
                         break
+                if debit_account_guid is None:
+                    oklass = classify_outflow(description)
+                    debit_account_guid = (
+                        get_or_create_account_guid(
+                            conn, list(oklass.account_path), oklass.account_type
+                        )
+                        if oklass is not None
+                        else expense_account_guid
+                    )
                 abs_amount = abs(amount)
                 entries = (
                     ledger.Entry(debit_account_guid, abs_amount,
