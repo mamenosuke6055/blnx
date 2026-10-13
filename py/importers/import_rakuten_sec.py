@@ -313,6 +313,7 @@ def import_rakuten_adjhistory_jp(csv_path: Path):
 
     count = 0
     seq = ledger.SeqCounter()
+    legacy_gate = ledger.LegacyGate()
     for _, row in df.iterrows():
         tx_type = str(row['取引区分']).strip()
 
@@ -360,7 +361,7 @@ def import_rakuten_adjhistory_jp(csv_path: Path):
                 ledger.Entry(rakuten_sec_acct, int(amount), 1, int(amount), 1),
                 ledger.Entry(peer, int(-amount), 1, int(-amount), 1),
             ),
-            currency_guid=jpy_guid, legacy_fitids=(legacy,)))
+            currency_guid=jpy_guid, legacy_fitids=legacy_gate(legacy)))
         if posted is not None:
             count += 1
 
@@ -415,6 +416,7 @@ def import_rakuten_withdrawal_list(csv_path: Path):
     
     count = 0
     seq = ledger.SeqCounter()
+    legacy_gate = ledger.LegacyGate()
     for _, row in df.iterrows():
         date = parse_rakuten_date(row['入出金日'])
         if not date: continue
@@ -461,7 +463,7 @@ def import_rakuten_withdrawal_list(csv_path: Path):
                 ledger.Entry(rakuten_sec_acct, int(amount), 1, int(amount), 1),
                 ledger.Entry(peer_account, int(-amount), 1, int(-amount), 1),
             ),
-            currency_guid=jpy_guid, legacy_fitids=(legacy,)))
+            currency_guid=jpy_guid, legacy_fitids=legacy_gate(legacy)))
         if posted is not None:
             count += 1
         
@@ -486,6 +488,7 @@ def import_rakuten_trade_invst(csv_path: Path):
     
     count = 0
     seq = ledger.SeqCounter()
+    legacy_gate = ledger.LegacyGate()
     for _, row in df.iterrows():
         date = parse_rakuten_date(row['約定日'])
         settle_date = parse_rakuten_date(row['受渡日'])
@@ -553,7 +556,7 @@ def import_rakuten_trade_invst(csv_path: Path):
             investment={"security_guid": sec_account, "type": inv_type, "units": units,
                         "unit_price": unit_price, "total_amount": total_amount,
                         "trade_date": date, "settle_date": settle_date},
-            legacy_fitids=(legacy,)))
+            legacy_fitids=legacy_gate(legacy)))
         if posted is not None:
             count += 1
 
@@ -575,6 +578,7 @@ def import_rakuten_trade_jp(csv_path: Path):
     
     count = 0
     seq = ledger.SeqCounter()
+    legacy_gate = ledger.LegacyGate()
     for _, row in df.iterrows():
         date = parse_rakuten_date(row['約定日'])
         settle_date = parse_rakuten_date(row['受渡日'])
@@ -632,7 +636,7 @@ def import_rakuten_trade_jp(csv_path: Path):
             investment={"security_guid": sec_account, "type": inv_type, "units": units,
                         "unit_price": unit_price, "total_amount": total_amount,
                         "trade_date": date, "settle_date": settle_date},
-            legacy_fitids=(legacy,)))
+            legacy_fitids=legacy_gate(legacy)))
         if posted is not None:
             count += 1
 

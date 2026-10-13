@@ -88,6 +88,22 @@ class SeqCounter:
         return self._seen[key]
 
 
+class LegacyGate:
+    """旧鍵(v1)を、ファイル内で同じ旧鍵の 1 本目にだけ申告させる。1 ファイル = 1 インスタンス。
+
+    v1 の鍵は連番を持たないので、同日・同額・同摘要の 2 本目も 1 本目と同じ旧鍵になる。
+    v1 はそれを 1 件に畳んでおり、DB にあるのは 1 本分だけ。2 本目にまで旧鍵を申告させると
+    「既知」として捨てられ、過少計上が永久に直らない。
+    """
+
+    def __init__(self) -> None:
+        self._seen: dict[str, int] = {}
+
+    def __call__(self, legacy_fitid: str) -> tuple[str, ...]:
+        self._seen[legacy_fitid] = self._seen.get(legacy_fitid, 0) + 1
+        return (legacy_fitid,) if self._seen[legacy_fitid] == 1 else ()
+
+
 def _minor(value: float | None) -> str:
     """金額を丸め誤差に強い整数表現にする(1/100 単位)。None は空文字。"""
     if value is None:

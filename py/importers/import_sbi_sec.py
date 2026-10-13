@@ -563,6 +563,7 @@ def import_sbi_domestic_trade_history(csv_path: Path):
 
     new_tx_count = 0
     seq = ledger.SeqCounter()
+    legacy_gate = ledger.LegacyGate()
 
     for _, row in df.iterrows():
         trade_date = parse_sbi_date(str(row['約定日']))
@@ -640,7 +641,7 @@ def import_sbi_domestic_trade_history(csv_path: Path):
             investment={"security_guid": security_account, "type": inv_type, "units": units,
                         "unit_price": unit_price, "total_amount": settlement,
                         "trade_date": trade_date, "settle_date": settle_date},
-            legacy_fitids=(legacy,)))
+            legacy_fitids=legacy_gate(legacy)))
         if posted is not None:
             new_tx_count += 1
 
@@ -717,9 +718,10 @@ def import_sbi_deposit_withdrawal(csv_path: Path):
     cursor = conn.cursor()
     
     sbi_usd_cash_account = get_or_create_account_guid(conn, ['Assets', 'Bank', 'SBI Securities', 'USD'], 'ASSET', 'BANK')
-    sbi_net_bank_account = get_or_create_account_guid(conn, ['Assets', 'Bank', 'SBI Sumishin Net Bank'], 'ASSET', 'BANK')
-    # Use a generic transfer account if the description doesn't match known banks
-    transfer_account = get_or_create_account_guid(conn, ['Assets', 'Transfer'], 'ASSET') 
+    # 相手は常に清算勘定。銀行側の明細(外貨預金の出金)も Assets:Transfer に記帳するので、
+    # 両方が取り込まれれば清算勘定で相殺される。銀行の口座を直接相手にすると、銀行側の
+    # 出金と二重に引かれる。旧実装は円建ての代表口座を相手にしていて、USD 額を円として引いていた
+    transfer_account = get_or_create_account_guid(conn, ['Assets', 'Transfer'], 'ASSET')
     
     usd_guid = get_currency_guid(conn, 'USD')
     
@@ -727,6 +729,7 @@ def import_sbi_deposit_withdrawal(csv_path: Path):
 
     new_tx_count = 0
     seq = ledger.SeqCounter()
+    legacy_gate = ledger.LegacyGate()
 
     for _, row in df.iterrows():
         date = parse_sbi_date(row['入出金日'])
@@ -740,10 +743,7 @@ def import_sbi_deposit_withdrawal(csv_path: Path):
         # Determine Amount and Peer Account
         amount = 0.0
         peer_account_guid = transfer_account
-        
-        if '住信SBIネット銀行' in desc:
-            peer_account_guid = sbi_net_bank_account
-        
+
         if in_amount > 0:
             amount = in_amount
             # Deposit into SBI Sec USD
@@ -768,7 +768,7 @@ def import_sbi_deposit_withdrawal(csv_path: Path):
                 ledger.Entry(peer_account_guid, int(-amount * 100), 100,
                              int(-amount * 100), 100),
             ),
-            currency_guid=usd_guid, legacy_fitids=(legacy,)))
+            currency_guid=usd_guid, legacy_fitids=legacy_gate(legacy)))
         if posted is not None:
             new_tx_count += 1
 
@@ -809,6 +809,7 @@ def import_sbi_trade_history(csv_path: Path):
 
     new_tx_count = 0
     seq = ledger.SeqCounter()
+    legacy_gate = ledger.LegacyGate()
 
     for _, row in df.iterrows():
         trade_date = parse_sbi_date(row['国内約定日'])
@@ -888,7 +889,7 @@ def import_sbi_trade_history(csv_path: Path):
             investment={"security_guid": security_account, "type": inv_type, "units": units,
                         "unit_price": unit_price, "total_amount": total_amount,
                         "trade_date": trade_date, "settle_date": settle_date},
-            legacy_fitids=(legacy,)))
+            legacy_fitids=legacy_gate(legacy)))
         if posted is not None:
             new_tx_count += 1
 
@@ -945,6 +946,7 @@ def import_sbi_jpy_deposit_withdrawal(csv_path: Path):
 
     new_count = 0
     seq = ledger.SeqCounter()
+    legacy_gate = ledger.LegacyGate()
     for _, row in df.iterrows():
         date = parse_sbi_date(row['入出金日'])
         if not date:
@@ -985,7 +987,7 @@ def import_sbi_jpy_deposit_withdrawal(csv_path: Path):
                 ledger.Entry(jpy_clearing, int(amount), 1, int(amount), 1),
                 ledger.Entry(peer, int(peer_amount), 1, int(peer_amount), 1),
             ),
-            currency_guid=jpy_guid, legacy_fitids=(legacy,)))
+            currency_guid=jpy_guid, legacy_fitids=legacy_gate(legacy)))
         if posted is not None:
             new_count += 1
 

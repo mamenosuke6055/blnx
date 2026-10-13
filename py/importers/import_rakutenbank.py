@@ -165,6 +165,8 @@ def import_rakuten_bank_csv(csv_path: Path, db_path: str = None):
         conn.commit()
 
         seq = ledger.SeqCounter()
+
+        legacy_gate = ledger.LegacyGate()
         new_transactions = 0
         for _, row in df.iterrows():
             amount = int(row['amount'])
@@ -219,7 +221,7 @@ def import_rakuten_bank_csv(csv_path: Path, db_path: str = None):
                 balance=balance,
                 seq=seq.next(row['date'], description, amount),
                 entries=entries,
-                legacy_fitids=(legacy_fitid(row),),
+                legacy_fitids=legacy_gate(legacy_fitid(row)),
             )
             try:
                 if ledger.post(conn, posting) is not None:
