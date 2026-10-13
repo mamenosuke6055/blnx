@@ -65,10 +65,20 @@ def test_normalize_trailing_import_code():
         normalize_card_merchant("サンプルストア")
 
 
-def test_normalize_etc_roundtrip_stays_distinct():
-    # ＥＴＣ往復（経路反転で同額同日）は別キーに保たれる＝正当な複数取引を統合しない
-    assert normalize_card_merchant("ＥＴＣカード売上　ｷﾀｲﾝﾀ ﾐﾅﾐｲﾝﾀ") != \
-        normalize_card_merchant("ＥＴＣカード売上　ﾐﾅﾐｲﾝﾀ ｷﾀｲﾝﾀ")
+def test_normalize_drops_detail_after_fullwidth_space():
+    # 版によって全角空白より後ろの詳細が付く/消える/書き換わる決済は同じキー
+    assert normalize_card_merchant("ＥＴＣカード売上") == \
+        normalize_card_merchant("ＥＴＣカード売上　ｷﾀｲﾝﾀ ﾐﾅﾐｲﾝﾀ")
+    assert normalize_card_merchant("サンプル光　ご利用料金") == \
+        normalize_card_merchant("サンプル光　ご利用料金　ｻﾝﾌﾟﾙﾋｶﾘ ｺﾞﾘﾖｳﾘｮｳｷ")
+    assert normalize_card_merchant("サンプル生命保険料　０８月分") == \
+        normalize_card_merchant("サンプル生命保険料　08ｶﾞﾂﾌﾞﾝ")
+
+
+def test_normalize_keeps_ascii_space_in_merchant():
+    # ASCII 空白は店名の一部。PAYPAL 経由の別店舗を同じキーにしない
+    assert normalize_card_merchant("PAYPAL *SHOPA") != normalize_card_merchant("PAYPAL *SHOPB")
+    assert normalize_card_merchant("ﾔﾏﾔ ﾓﾊﾞﾗﾃﾝ") != normalize_card_merchant("ﾔﾏﾔ ｷﾀﾃﾝ")
 
 
 def test_dedup_key_distinct_merchants_same_amount():
@@ -208,4 +218,62 @@ def test_confirmed_format_does_not_duplicate_two_identical_purchases(tmp_path):
         ("2025/06/12", "ＶＩＳＡ国内利用　VS ｾﾌﾞﾝｲﾚﾌﾞﾝ", "500"),
     ])
     import_rakuten_card_csv(confirmed, str(db))
+    assert _tx_count(db) == 2
+
+
+def test_detail_variants_across_files_do_not_duplicate(tmp_path):
+    """速報版(詳細なし)の後に確定版(全角空白の後ろに経路・品目)を取り込んでも増えない。
+
+    往復(同日同額 2 本)はどちらの版にも 2 本あり、件数で突合されて 2 本のまま。
+    """
+    db = _make_db(tmp_path)
+    early = tmp_path / "enavi_early.csv"
+    _write_enavi(early, [
+        ("2025/04/02", "ＥＴＣカード売上", "300"),
+        ("2025/04/02", "ＥＴＣカード売上", "300"),
+        ("2025/04/05", "サンプル光　ご利用料金", "4000"),
+        ("2025/04/08", "サンプル生命保険料　０８月分", "5000"),
+    ])
+    import_rakuten_card_csv(early, str(db))
+    assert _tx_count(db) == 4
+
+    confirmed = tmp_path / "enavi_confirmed.csv"
+    _write_enavi(confirmed, [
+        ("2025/04/02", "ＥＴＣカード売上　ｷﾀｲﾝﾀ ﾐﾅﾐｲﾝﾀ", "300"),
+        ("2025/04/02", "ＥＴＣカード売上　ﾐﾅﾐｲﾝﾀ ｷﾀｲﾝﾀ", "300"),
+        ("2025/04/05", "サンプル光　ご利用料金　ｻﾝﾌﾟﾙﾋｶﾘ ｺﾞﾘﾖｳﾘｮｳｷ", "4000"),
+        ("2025/04/08", "サンプル生命保険料　08ｶﾞﾂﾌﾞﾝ", "5000"),
+    ])
+    import_rakuten_card_csv(confirmed, str(db))
+    assert _tx_count(db) == 4
+
+    # 逆順(確定版 → 速報版)でも同じ
+    (tmp_path / "rev").mkdir()
+    db2 = _make_db(tmp_path / "rev")
+    import_rakuten_card_csv(confirmed, str(db2))
+    import_rakuten_card_csv(early, str(db2))
+    assert _tx_count(db2) == 4
+
+
+def test_recovers_second_identical_purchase_collapsed_by_v1(tmp_path):
+    """v1 が同日・同額・同摘要の 2 本を 1 件に畳んでいた DB に再取込すると、2 本目が補われる。"""
+    import hashlib
+    db = _make_db(tmp_path)
+    csvp = tmp_path / "enavi.csv"
+    _write_enavi(csvp, [("2025/04/01", "ＥＴＣカード売上", "500")])
+    import_rakuten_card_csv(csvp, str(db))
+    # 既存行を v1 の鍵・方式に書き換えて、v1 時代の状態を再現する
+    v1 = "SHA256:" + hashlib.sha256("RAKUTENCARD:2025-04-01:500:ＥＴＣカード売上".encode()).hexdigest()
+    c = sqlite3.connect(db)
+    c.execute("UPDATE transactions SET ofx_fitid=?, fitid_policy='v1', natural_key=NULL", (v1,))
+    c.commit()
+    c.close()
+
+    _write_enavi(csvp, [
+        ("2025/04/01", "ＥＴＣカード売上", "500"),
+        ("2025/04/01", "ＥＴＣカード売上", "500"),
+    ])
+    import_rakuten_card_csv(csvp, str(db))
+    assert _tx_count(db) == 2
+    import_rakuten_card_csv(csvp, str(db))
     assert _tx_count(db) == 2

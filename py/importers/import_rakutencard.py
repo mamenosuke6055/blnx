@@ -38,18 +38,31 @@ def normalize_card_merchant(description: str) -> str:
     すり抜ける。ブランド接頭辞・「利用国XX」接尾辞・末尾の取込コード数字を除去し、
     全角半角を NFKC で畳んで両形式を同一キーに収束させる。
 
-    ＥＴＣ往復（経路違いで同額同日）のように経路情報が残るものは正規化後も別キーに
-    なるため、正当な複数取引を誤って統合しない。
+    さらに同じ決済でも、明細の版によって**全角空白より後ろの詳細**が付いたり消えたり
+    書き換わったりする:
+      「ＥＴＣカード売上」         ↔ 「ＥＴＣカード売上　<入口> <出口>」
+      「<店名>　ご利用料金」       ↔ 「<店名>　ご利用料金　<半角カナの品目>」
+      「<品目>　０８月分」         ↔ 「<品目>　08ｶﾞﾂﾌﾞﾝ」
+    そこで最初の全角空白で切り、前半だけをキーにする。ASCII 空白は店名の一部
+    (「PAYPAL *<店>」「ﾔﾏﾔ ﾓﾊﾞﾗﾃﾝ」)なので切らない。
+
+    ＥＴＣ往復(同日同額)のように詳細を落とすと同じキーになる正当な複数取引は、
+    呼び出し側が**件数**で突合するので潰れない(card_dedup_key の利用箇所を参照)。
+    根拠 = love docs/Doc_Card_Merchant_Key_Simulation.md
     """
-    s = unicodedata.normalize("NFKC", description or "")
-    # ブランド明細の接頭辞を除去（NFKC 後は ＶＩＳＡ→VISA, 全角空白→半角）
+    # 全角空白を NFKC で半角空白に潰される前に区切り記号へ退避する
+    s = unicodedata.normalize("NFKC", (description or "").replace("\u3000", "\x1f"))
+    # ブランド明細の接頭辞を除去（NFKC 後は ＶＩＳＡ→VISA）
     s = re.sub(
-        r"^(VISA|JCB|MasterCard|Master|AMEX|Diners|ダイナース)\s*(国内|海外)利用\s*(VS|QP)?\s*",
+        r"^(VISA|JCB|MasterCard|Master|AMEX|Diners|ダイナース)[\s\x1f]*(国内|海外)利用"
+        r"[\s\x1f]*(VS|QP)?[\s\x1f]*",
         "",
         s,
     )
     # 生マーチャント形式の「利用国XX」接尾辞を除去
     s = re.sub(r"利用国..$", "", s)
+    # 最初の全角空白より後ろ(版によって変わる詳細)を落とす
+    s = s.split("\x1f")[0]
     # 末尾の取込コード（2個以上の空白に続く数字列）を除去
     s = re.sub(r"\s{2,}\d+$", "", s)
     # 残りの空白を畳む
@@ -216,6 +229,9 @@ def import_rakuten_card_csv(csv_path: Path, db_path: str = None):
         for _, row in df.iterrows():
             amount = int(row['amount'])
             dedup_key = row['_dedup_key']
+            # 連番は飛ばす行も含めて数える。取込済みの行を数えないと、自然キーが
+            # DB の状態で変わり(冪等でなくなり)、v1 で畳まれた 2 本目も 1 本目扱いになる
+            n = seq.next(row['date'], row['description'], amount)
             seen_in_file[dedup_key] += 1
             # この鍵は DB に既に n 件ある → ファイル内 n 本目までは取込済みとみなす
             if seen_in_file[dedup_key] <= existing_counts[dedup_key]:
@@ -228,7 +244,7 @@ def import_rakuten_card_csv(csv_path: Path, db_path: str = None):
                 description=row['description'],
                 amount=amount,
                 balance=None,      # カード明細に残高欄はない(連番で分ける)
-                seq=seq.next(row['date'], row['description'], amount),
+                seq=n,
                 # 費用(借方) / 負債の増加(貸方)
                 entries=(
                     ledger.Entry(expense_account_guid, amount,
@@ -237,7 +253,10 @@ def import_rakuten_card_csv(csv_path: Path, db_path: str = None):
                                  quantity_num=-amount, quantity_denom=1),
                 ),
                 currency_guid=jpy_guid,
-                legacy_fitids=(row['_legacy_fitid'],),
+                # v1 の鍵は同日・同額・同摘要の 2 本目以降も 1 本目と同じ値になる(v1 は
+                # それを 1 件に畳んでいた)。2 本目以降まで旧鍵で突き合わせると、件数照合が
+                # 「足りない」と判定した正当な 2 本目を既知として捨ててしまう。
+                legacy_fitids=(row['_legacy_fitid'],) if n == 1 else (),
             )
             try:
                 if ledger.post(conn, posting) is not None:
