@@ -143,8 +143,8 @@ def test_import_keeps_etc_roundtrip(tmp_path):
     db = _make_db(tmp_path)
     csvp = tmp_path / "enavi.csv"
     _write_enavi(csvp, [
-        ("2026/03/16", "ＥＴＣカード売上　ｷﾀｲﾝﾀ ﾐﾅﾐｲﾝﾀ", "90"),
-        ("2026/03/16", "ＥＴＣカード売上　ﾐﾅﾐｲﾝﾀ ｷﾀｲﾝﾀ", "90"),
+        ("2025/03/10", "ＥＴＣカード売上　ｷﾀｲﾝﾀ ﾐﾅﾐｲﾝﾀ", "70"),
+        ("2025/03/10", "ＥＴＣカード売上　ﾐﾅﾐｲﾝﾀ ｷﾀｲﾝﾀ", "70"),
     ])
     import_rakuten_card_csv(csvp, str(db))
     assert _tx_count(db) == 2
