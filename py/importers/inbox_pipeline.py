@@ -46,6 +46,8 @@ def _import_one(csv_file: Path, source: str, db_path: Path) -> None:
         import_resona_bank.import_resona_bank_csv(csv_file, db_path)
     elif source == 'asset_balance':
         import_asset_balance.import_asset_balance_csv(csv_file, db_path)
+        # 同じ CSV の「保有商品詳細」を銘柄ごとの時価スナップとして取る(上は合計のみ)
+        import_rakuten_sec.import_rakuten_asset_balance(csv_file)
     elif source == 'amazon':
         import_amazon_history.import_amazon_history(csv_file, db_path)
 

@@ -105,3 +105,17 @@ def test_run_inbox_import_moves_processed(monkeypatch, finance_db, raw_conn, tmp
 
     assert not list(inbox.glob("*.csv"))           # inbox は空に
     assert (processed / "rb-20260601.csv").exists()  # processed へ移動
+
+
+def test_asset_balance_also_imports_per_holding_snapshots(monkeypatch, finance_db, tmp_path):
+    """資産残高 CSV は合計(balance_snapshots)だけでなく銘柄ごとの時価スナップ
+    (asset_snapshots)も取り込む。後者が無いと、時価を測る下流が古いスナップしか
+    持てない。"""
+    calls = []
+    monkeypatch.setattr(inbox_pipeline.import_asset_balance, "import_asset_balance_csv",
+                        lambda f, db: calls.append("total"))
+    monkeypatch.setattr(inbox_pipeline.import_rakuten_sec, "import_rakuten_asset_balance",
+                        lambda f: calls.append("holdings"))
+    inbox_pipeline._import_one(tmp_path / "assetbalance(all)_20260101_000000.csv",
+                               "asset_balance", finance_db)
+    assert calls == ["total", "holdings"]
