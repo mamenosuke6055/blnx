@@ -21,10 +21,11 @@ def test_realized_pl_points_to_yakujo():
     assert ignored_report(Path("realized_pl(JP)_20260604_145403.csv")) is not None
 
 
-def test_assetbalance_invst_points_to_savefile():
+def test_assetbalance_invst_points_to_assetbalance_all():
     res = ignored_report(Path("assetbalance(INVST)_20260616_223320.csv"))
     assert res is not None
-    assert "保有証券一覧" in res[1] or "SaveFile" in res[1]
+    assert "楽天証券" in res[0]
+    assert "assetbalance(all)" in res[1]
 
 
 def test_real_import_files_are_not_ignored():
